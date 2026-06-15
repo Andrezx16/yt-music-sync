@@ -30,19 +30,15 @@ log = logging.getLogger(__name__)
 
 def get_youtube():
     auth_file = "ytmusic_auth.json"
-
     raw = os.environ.get("YTMUSIC_AUTH")
     if raw:
         with open(auth_file, "w", encoding="utf-8") as f:
             f.write(raw)
-
     if not os.path.exists(auth_file):
         log.error("No se encontró ytmusic_auth.json. Corre setup_ytmusic_web.py primero.")
         sys.exit(1)
-
     with open(auth_file) as f:
         token_data = json.load(f)
-
     creds = Credentials(
         token=token_data["access_token"],
         refresh_token=token_data["refresh_token"],
@@ -51,13 +47,11 @@ def get_youtube():
         client_secret=token_data["client_secret"],
         scopes=["https://www.googleapis.com/auth/youtube"],
     )
-
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
         token_data["access_token"] = creds.token
         with open(auth_file, "w") as f:
             json.dump(token_data, f, indent=2)
-
     return build("youtube", "v3", credentials=creds)
 
 
@@ -65,12 +59,10 @@ def get_youtube():
 
 def get_spotify():
     cache_path = ".spotify_cache"
-
     raw = os.environ.get("SPOTIFY_CACHE_TOKEN")
     if raw:
         with open(cache_path, "w", encoding="utf-8") as f:
             f.write(raw)
-
     auth_manager = SpotifyOAuth(
         client_id=os.environ["SPOTIFY_CLIENT_ID"],
         client_secret=os.environ["SPOTIFY_CLIENT_SECRET"],
@@ -82,12 +74,13 @@ def get_spotify():
     return spotipy.Spotify(auth_manager=auth_manager)
 
 
-# ─── Helpers Spotify (requests directos, sin spotipy para evitar params extra) ──
+# ─── Helpers Spotify ─────────────────────────────────────────────────────────
 
 def sp_headers(sp):
     sp.auth_manager.validate_token(sp.auth_manager.get_cached_token())
     token = sp.auth_manager.get_cached_token()["access_token"]
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
 
 def sp_get(sp, url, params=None):
     r = requests.get(url, headers=sp_headers(sp), params=params or {})
@@ -99,11 +92,6 @@ def sp_post(sp, url, payload):
     r = requests.post(url, headers=sp_headers(sp), json=payload)
     r.raise_for_status()
     return r.json()
-
-
-def sp_put(sp, url, payload):
-    r = requests.put(url, headers=sp_headers(sp), json=payload)
-    r.raise_for_status()
 
 
 def sp_delete(sp, url, payload):
@@ -140,14 +128,10 @@ def get_or_create_spotify_playlist(sp, name: str) -> str:
         result = sp_get(sp, "https://api.spotify.com/v1/me/playlists", {"limit": 50, "offset": offset})
         for pl in result["items"]:
             if pl["name"] == name:
-                log.info(f"  Playlist encontrada: '{name}' → {pl['id']}")
                 return pl["id"]
         if result["next"] is None:
             break
         offset += 50
-
-        
-    # Crear con POST /me/playlists (endpoint correcto feb 2026)
     pl = sp_post(sp, "https://api.spotify.com/v1/me/playlists", {
         "name": name,
         "public": False,
@@ -158,16 +142,14 @@ def get_or_create_spotify_playlist(sp, name: str) -> str:
 
 
 def get_spotify_tracks(sp, playlist_id: str) -> list[dict]:
-    """Usa GET /playlists/{id}/items (endpoint correcto feb 2026)."""
     tracks = []
     offset = 0
     while True:
         result = sp_get(sp, f"https://api.spotify.com/v1/playlists/{playlist_id}/items",
                         {"limit": 100, "offset": offset})
-
         for item in result.get("items", []):
-            t = item.get("item")
-
+            # /items usa la key "item", el endpoint legacy usaba "track"
+            t = item.get("item") or item.get("track")
             if not t or not t.get("id"):
                 continue
             artists = ", ".join(a["name"] for a in t.get("artists", []))
@@ -181,47 +163,46 @@ def get_spotify_tracks(sp, playlist_id: str) -> list[dict]:
 def search_spotify_track(sp, title: str, artist: str) -> str | None:
     artist_clean = artist.replace(" - Topic", "").strip()
     query = f"track:{title} artist:{artist_clean}" if artist_clean else f"track:{title}"
-    try:
-        result = sp_get(sp, "https://api.spotify.com/v1/search",
-                        {"q": query, "type": "track", "limit": 1})
-        items = result["tracks"]["items"]
-        if items:
-            return items[0]["id"]
-        # Segundo intento más simple
-        result = sp_get(sp, "https://api.spotify.com/v1/search",
-                        {"q": f"{title} {artist_clean}", "type": "track", "limit": 1})
-        items = result["tracks"]["items"]
-        return items[0]["id"] if items else None
-    except Exception as e:
-        log.warning(f"  Error buscando '{title}': {e}")
-        return None
+    for attempt in range(3):
+        try:
+            result = sp_get(sp, "https://api.spotify.com/v1/search",
+                            {"q": query, "type": "track", "limit": 1})
+            items = result["tracks"]["items"]
+            if items:
+                return items[0]["id"]
+            result = sp_get(sp, "https://api.spotify.com/v1/search",
+                            {"q": f"{title} {artist_clean}", "type": "track", "limit": 1})
+            items = result["tracks"]["items"]
+            return items[0]["id"] if items else None
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                wait = int(e.response.headers.get("Retry-After", 5))
+                log.warning(f"  Rate limit, esperando {wait}s...")
+                time.sleep(wait)
+            else:
+                log.warning(f"  Error buscando '{title}': {e}")
+                return None
+        except Exception as e:
+            log.warning(f"  Error buscando '{title}': {e}")
+            return None
+    log.warning(f"  No se pudo buscar '{title}' tras 3 intentos.")
+    return None
 
 
-def add_tracks_to_playlist(sp, playlist_id: str, track_ids: list[str], position: int = None):
-    """Agrega tracks en una posicion especifica."""
+def clear_playlist(sp, playlist_id: str, current_tracks: list[dict]):
+    """Vacia la playlist eliminando todos los tracks actuales."""
+    if not current_tracks:
+        return
     base_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/items"
-    for i in range(0, len(track_ids), 100):
-        chunk = [f"spotify:track:{tid}" for tid in track_ids[i:i+100]]
-        payload = {"uris": chunk}
-        if position is not None:
-            payload["position"] = position + i
-        sp_post(sp, base_url, payload)
-        time.sleep(0.3)
+    all_items = [{"uri": f"spotify:track:{t['id']}"} for t in current_tracks]
+    for i in range(0, len(all_items), 100):
+        sp_delete(sp, base_url, {"items": all_items[i:i+100]})
+        time.sleep(0.2)
 
 
-def remove_tracks_from_playlist(sp, playlist_id: str, track_ids: list[str]):
-    """Elimina tracks especificos de la playlist."""
+def add_tracks(sp, playlist_id: str, track_ids: list[str]):
+    """Agrega tracks en orden."""
     base_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/items"
-    for i in range(0, len(track_ids), 100):
-        chunk = [{"uri": f"spotify:track:{tid}"} for tid in track_ids[i:i+100]]
-        sp_delete(sp, base_url, {"tracks": chunk})
-        time.sleep(0.3)
-
-
-def reorder_playlist(sp, playlist_id: str, track_ids: list[str]):
-    """Reemplaza el orden completo de la playlist."""
-    base_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/items"
-    sp_put(sp, base_url, {"uris": []})
     for i in range(0, len(track_ids), 100):
         chunk = [f"spotify:track:{tid}" for tid in track_ids[i:i+100]]
         sp_post(sp, base_url, {"uris": chunk})
@@ -242,29 +223,50 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
     sp_tracks = get_spotify_tracks(sp, sp_playlist_id)
     log.info(f"  Spotify actual: {len(sp_tracks)} canciones")
 
-    # 3. Construir mapa de tracks ya conocidos en Spotify (nombre+artista -> id)
-    sp_track_map = {(t["name"].lower(), t["artist"].lower()): t["id"] for t in sp_tracks}
+    # 3. Mapa de tracks actuales en Spotify
+    # Usamos dos mapas: uno por (titulo+artista_principal) y otro solo por titulo
+    # Spotify incluye todos los colaboradores pero YTM solo muestra el artista principal
     sp_ids_current = [t["id"] for t in sp_tracks]
 
-    # 4. Resolver IDs de Spotify para cada track de YTM
+    # Mapa por titulo+primer_artista (artista principal)
+    sp_map_title_artist = {}
+    # Mapa por solo titulo (fallback)
+    sp_map_title_only = {}
+    for t in sp_tracks:
+        title = t["name"].lower()
+        first_artist = t["artist"].split(",")[0].strip().lower()
+        sp_map_title_artist[(title, first_artist)] = t["id"]
+        if title not in sp_map_title_only:
+            sp_map_title_only[title] = t["id"]
+
+    # 4. Resolver IDs para cada track de YTM
+    # Solo busca en Spotify canciones NUEVAS, las existentes las reutiliza
     not_found = []
-    new_track_ids = []  # Lista final en el orden de YTM
+    new_track_ids = []
 
     for track in ytm_tracks:
-        key = (track["title"].lower(), track["artist"].lower())
-        if key in sp_track_map:
-            new_track_ids.append(sp_track_map[key])
+        title  = track["title"].lower()
+        artist = track["artist"].lower()
+        key_full  = (title, artist)
+        key_title = title
+
+        if key_full in sp_map_title_artist:
+            new_track_ids.append(sp_map_title_artist[key_full])
+        elif key_title in sp_map_title_only:
+            new_track_ids.append(sp_map_title_only[key_title])
         else:
             spotify_id = search_spotify_track(sp, track["title"], track["artist"])
             if spotify_id:
                 new_track_ids.append(spotify_id)
-                sp_track_map[key] = spotify_id  # cachear para no buscar dos veces
+                sp_map_title_artist[key_full] = spotify_id
+                sp_map_title_only[title] = spotify_id
+                log.info(f"  ✓ Nueva: {track['artist']} — {track['title']}")
             else:
                 not_found.append(f"{track['artist']} — {track['title']}")
                 log.warning(f"  ✗ No encontrada: {track['artist']} — {track['title']}")
-            time.sleep(0.1)
+            time.sleep(0.2)
 
-    # 5. Comparar con estado actual
+    # 5. Sin cambios
     if new_track_ids == sp_ids_current:
         log.info(f"  ✅ Sin cambios.")
         return
@@ -272,24 +274,21 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
     # 6. Calcular diferencias
     new_set = set(new_track_ids)
     old_set = set(sp_ids_current)
-
-    to_add    = [tid for tid in new_track_ids if tid not in old_set]
-    to_remove = [tid for tid in sp_ids_current if tid not in new_set]
+    to_add       = [tid for tid in new_track_ids if tid not in old_set]
+    to_remove    = [tid for tid in sp_ids_current if tid not in new_set]
     order_changed = new_track_ids != [t for t in sp_ids_current if t in new_set]
 
     log.info(f"  + Agregar: {len(to_add)} | - Eliminar: {len(to_remove)} | ↕ Reordenar: {order_changed}")
 
     # 7. Aplicar cambios
-    if to_remove:
-        remove_tracks_from_playlist(sp, sp_playlist_id, to_remove)
-        for tid in to_remove:
-            log.info(f"  - Eliminada: {tid}")
+    # Siempre vaciamos y rellenamos en orden correcto para garantizar consistencia
+    clear_playlist(sp, sp_playlist_id, sp_tracks)
+    add_tracks(sp, sp_playlist_id, new_track_ids)
 
-    if to_add or order_changed:
-        # Si hay canciones nuevas o el orden cambió, reordenamos todo
-        reorder_playlist(sp, sp_playlist_id, new_track_ids)
-        for tid in to_add:
-            log.info(f"  + Agregada: {tid}")
+    for tid in to_add:
+        log.info(f"  + Agregada: {tid}")
+    for tid in to_remove:
+        log.info(f"  - Eliminada: {tid}")
 
     log.info(f"  ✅ Sincronización completa: {len(new_track_ids)} canciones")
 
@@ -303,25 +302,20 @@ def main():
     if not os.path.exists("config.json"):
         log.error("No se encontró config.json. Corre setup_playlists.py primero.")
         sys.exit(1)
-
     with open("config.json", encoding="utf-8") as f:
         config = json.load(f)
-
     playlists = config.get("playlists", [])
     if not playlists:
         log.error("config.json no tiene playlists configuradas.")
         sys.exit(1)
-
     log.info(f"Iniciando sincronización de {len(playlists)} playlist(s)...")
     youtube = get_youtube()
     sp      = get_spotify()
-
     for pl in playlists:
         try:
             sync_playlist(youtube, sp, pl["youtube_music_id"], pl["spotify_name"])
         except Exception as e:
             log.error(f"Error sincronizando '{pl.get('spotify_name')}': {e}")
-
     log.info("✅ Sincronización completa.")
 
 

@@ -3,6 +3,10 @@ ytmusic_auth.json
 .spotify_cache
 .env
 
+# Archivos de configuración personal (contienen IDs de tus playlists)
+config.json
+
+
 # Python
 __pycache__/
 *.pyc
