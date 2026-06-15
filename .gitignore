@@ -2,7 +2,7 @@
 ytmusic_auth.json
 .spotify_cache
 .env
-
+spotify_search_cache.json
 
 # Python
 __pycache__/

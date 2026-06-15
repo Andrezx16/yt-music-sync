@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+import random
 import logging
 import requests
 
@@ -30,6 +31,57 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+# ─── Cache de búsquedas Spotify ──────────────────────────────────────────────
+# Persiste entre ejecuciones. Guarda también resultados negativos (None).
+# Formato: { "title::artist": "spotify_id" | null }
+
+SEARCH_CACHE_FILE = "spotify_search_cache.json"
+_search_cache: dict = {}  # cargado una vez en main(), actúa también como memoria temporal
+
+
+def load_search_cache() -> None:
+    global _search_cache
+    if os.path.exists(SEARCH_CACHE_FILE):
+        with open(SEARCH_CACHE_FILE, encoding="utf-8") as f:
+            _search_cache = json.load(f)
+        log.info(f"Cache cargado: {len(_search_cache)} entradas en {SEARCH_CACHE_FILE}")
+    else:
+        _search_cache = {}
+
+
+def save_search_cache() -> None:
+    with open(SEARCH_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(_search_cache, f, ensure_ascii=False, indent=2)
+
+
+def _cache_key(title: str, artist: str) -> str:
+    return f"{title.lower()}::{artist.lower()}"
+
+
+def get_cached_track(title: str, artist: str) -> tuple[bool, str | None]:
+    """Retorna (found_in_cache, spotify_id_or_None)."""
+    key = _cache_key(title, artist)
+    if key in _search_cache:
+        return True, _search_cache[key]
+    return False, None
+
+
+def set_cached_track(title: str, artist: str, spotify_id: str | None) -> None:
+    _search_cache[_cache_key(title, artist)] = spotify_id
+
+
+# ─── Métricas ────────────────────────────────────────────────────────────────
+
+metrics = {
+    "spotify_requests": 0,
+    "cache_hits":       0,
+    "spotify_searches": 0,
+    "tracks_added":     0,
+    "tracks_removed":   0,
+    "rate_limit_waits": 0,
+}
+
 
 # ─── Autenticación YouTube ───────────────────────────────────────────────────
 
@@ -88,18 +140,21 @@ def sp_headers(sp):
 
 
 def sp_get(sp, url, params=None):
+    metrics["spotify_requests"] += 1
     r = requests.get(url, headers=sp_headers(sp), params=params or {})
     r.raise_for_status()
     return r.json()
 
 
 def sp_post(sp, url, payload):
+    metrics["spotify_requests"] += 1
     r = requests.post(url, headers=sp_headers(sp), json=payload)
     r.raise_for_status()
     return r.json()
 
 
 def sp_delete(sp, url, payload):
+    metrics["spotify_requests"] += 1
     r = requests.delete(url, headers=sp_headers(sp), json=payload)
     r.raise_for_status()
 
@@ -153,7 +208,6 @@ def get_spotify_tracks(sp, playlist_id: str) -> list[dict]:
         result = sp_get(sp, f"https://api.spotify.com/v1/playlists/{playlist_id}/items",
                         {"limit": 100, "offset": offset})
         for item in result.get("items", []):
-            # /items usa la key "item", el endpoint legacy usaba "track"
             t = item.get("item") or item.get("track")
             if not t or not t.get("id"):
                 continue
@@ -166,56 +220,100 @@ def get_spotify_tracks(sp, playlist_id: str) -> list[dict]:
 
 
 def search_spotify_track(sp, title: str, artist: str) -> str | None:
+    """
+    Busca en Spotify con reintentos reactivos al 429.
+    Lee el cache antes de hacer cualquier request.
+    Guarda el resultado (positivo o negativo) en cache.
+    """
+    # ── 1. Consultar cache primero ──────────────────────────────────────────
+    in_cache, cached_id = get_cached_track(title, artist)
+    if in_cache:
+        metrics["cache_hits"] += 1
+        return cached_id
+
+    # ── 2. Llamar a Spotify ─────────────────────────────────────────────────
+    metrics["spotify_searches"] += 1
     artist_clean = artist.replace(" - Topic", "").strip()
-    query = f"track:{title} artist:{artist_clean}" if artist_clean else f"track:{title}"
+    query_strict = f"track:{title} artist:{artist_clean}" if artist_clean else f"track:{title}"
+    query_loose  = f"{title} {artist_clean}"
+
     for attempt in range(3):
         try:
             result = sp_get(sp, "https://api.spotify.com/v1/search",
-                            {"q": query, "type": "track", "limit": 1})
+                            {"q": query_strict, "type": "track", "limit": 1})
             items = result["tracks"]["items"]
             if items:
-                return items[0]["id"]
+                spotify_id = items[0]["id"]
+                set_cached_track(title, artist, spotify_id)
+                return spotify_id
+
+            # Fallback: query libre
             result = sp_get(sp, "https://api.spotify.com/v1/search",
-                            {"q": f"{title} {artist_clean}", "type": "track", "limit": 1})
+                            {"q": query_loose, "type": "track", "limit": 1})
             items = result["tracks"]["items"]
-            return items[0]["id"] if items else None
+            spotify_id = items[0]["id"] if items else None
+            set_cached_track(title, artist, spotify_id)  # guarda también None
+            return spotify_id
+
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
+                # ── Rate limit reactivo ─────────────────────────────────────
                 wait = int(e.response.headers.get("Retry-After", 5))
                 if wait > 60:
                     raise SpotifyRateLimitError(
                         f"Spotify rate limit de {wait}s — abortando búsquedas"
                     )
-                log.warning(f"  Rate limit, esperando {wait}s...")
-                time.sleep(wait)
+                jitter = random.uniform(0.2, 1.0)
+                total_wait = wait + jitter
+                metrics["rate_limit_waits"] += 1
+                log.warning(f"  Rate limit, esperando {total_wait:.1f}s...")
+                time.sleep(total_wait)
+                # Reintenta el mismo attempt (no incrementa)
+                continue
             else:
                 log.warning(f"  Error buscando '{title}': {e}")
+                set_cached_track(title, artist, None)
                 return None
         except Exception as e:
             log.warning(f"  Error buscando '{title}': {e}")
+            set_cached_track(title, artist, None)
             return None
+
     log.warning(f"  No se pudo buscar '{title}' tras 3 intentos.")
+    set_cached_track(title, artist, None)
     return None
 
 
 def clear_playlist(sp, playlist_id: str, current_tracks: list[dict]):
-    """Vacia la playlist eliminando todos los tracks actuales."""
+    """Vacía la playlist eliminando todos los tracks actuales."""
     if not current_tracks:
         return
     base_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/items"
     all_items = [{"uri": f"spotify:track:{t['id']}"} for t in current_tracks]
     for i in range(0, len(all_items), 100):
         sp_delete(sp, base_url, {"items": all_items[i:i+100]})
-        time.sleep(0.2)
+
+
+def remove_tracks(sp, playlist_id: str, track_ids: list[str]):
+    """Elimina solo los tracks indicados (sin vaciar la playlist completa)."""
+    if not track_ids:
+        return
+    base_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/items"
+    all_items = [{"uri": f"spotify:track:{tid}"} for tid in track_ids]
+    for i in range(0, len(all_items), 100):
+        sp_delete(sp, base_url, {"items": all_items[i:i+100]})
+    metrics["tracks_removed"] += len(track_ids)
 
 
 def add_tracks(sp, playlist_id: str, track_ids: list[str]):
-    """Agrega tracks en orden."""
+    """Agrega tracks en orden (máximo 100 por request)."""
+    if not track_ids:
+        return
     base_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/items"
     for i in range(0, len(track_ids), 100):
         chunk = [f"spotify:track:{tid}" for tid in track_ids[i:i+100]]
         sp_post(sp, base_url, {"uris": chunk})
-        time.sleep(0.3)
+    metrics["tracks_added"] += len(track_ids)
 
 
 # ─── Sincronización ──────────────────────────────────────────────────────────
@@ -232,37 +330,31 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
     sp_tracks = get_spotify_tracks(sp, sp_playlist_id)
     log.info(f"  Spotify actual: {len(sp_tracks)} canciones")
 
-    # 3. Mapa de tracks actuales en Spotify
-    # Usamos dos mapas: uno por (titulo+artista_principal) y otro solo por titulo
-    # Spotify incluye todos los colaboradores pero YTM solo muestra el artista principal
+    # 3. Mapas de tracks actuales en Spotify
     sp_ids_current = [t["id"] for t in sp_tracks]
+    old_set = set(sp_ids_current)
 
-    # Mapa por titulo+primer_artista (artista principal)
     sp_map_title_artist = {}
-    # Mapa por solo titulo (fallback)
-    sp_map_title_only = {}
+    sp_map_title_only   = {}
     for t in sp_tracks:
-        title = t["name"].lower()
+        title        = t["name"].lower()
         first_artist = t["artist"].split(",")[0].strip().lower()
         sp_map_title_artist[(title, first_artist)] = t["id"]
         if title not in sp_map_title_only:
             sp_map_title_only[title] = t["id"]
 
     # 4. Resolver IDs para cada track de YTM
-    # Solo busca en Spotify canciones NUEVAS, las existentes las reutiliza
-    not_found = []
+    not_found    = []
     new_track_ids = []
 
     for track in ytm_tracks:
         title  = track["title"].lower()
         artist = track["artist"].lower()
-        key_full  = (title, artist)
-        key_title = title
 
-        if key_full in sp_map_title_artist:
-            new_track_ids.append(sp_map_title_artist[key_full])
-        elif key_title in sp_map_title_only:
-            new_track_ids.append(sp_map_title_only[key_title])
+        if (title, artist) in sp_map_title_artist:
+            new_track_ids.append(sp_map_title_artist[(title, artist)])
+        elif title in sp_map_title_only:
+            new_track_ids.append(sp_map_title_only[title])
         else:
             try:
                 spotify_id = search_spotify_track(sp, track["title"], track["artist"])
@@ -270,16 +362,16 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
                 log.warning(f"  ⏸ {e}")
                 log.warning("  Las canciones pendientes se procesarán en el próximo run.")
                 not_found.append(f"{track['artist']} — {track['title']} (pendiente)")
-                break  # Salir del loop completo, no solo saltar una canción
+                break
             if spotify_id:
                 new_track_ids.append(spotify_id)
-                sp_map_title_artist[key_full] = spotify_id
+                sp_map_title_artist[(title, artist)] = spotify_id
                 sp_map_title_only[title] = spotify_id
                 log.info(f"  ✓ Nueva: {track['artist']} — {track['title']}")
             else:
                 not_found.append(f"{track['artist']} — {track['title']}")
                 log.warning(f"  ✗ No encontrada: {track['artist']} — {track['title']}")
-            time.sleep(0.5)  # Pausa entre búsquedas para no saturar el rate limit
+            # ── Sin sleep fijo: el rate limit reactivo en search_spotify_track lo maneja
 
     # 5. Sin cambios
     if new_track_ids == sp_ids_current:
@@ -288,17 +380,32 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
 
     # 6. Calcular diferencias
     new_set = set(new_track_ids)
-    old_set = set(sp_ids_current)
-    to_add       = [tid for tid in new_track_ids if tid not in old_set]
-    to_remove    = [tid for tid in sp_ids_current if tid not in new_set]
-    order_changed = new_track_ids != [t for t in sp_ids_current if t in new_set]
+    to_add    = [tid for tid in new_track_ids if tid not in old_set]
+    to_remove = [tid for tid in sp_ids_current if tid not in new_set]
+
+    # Comparar orden relativo de las canciones comunes en ambas listas.
+    # Ignora las nuevas y las eliminadas — solo verifica si el orden cambió.
+    common_in_new = [tid for tid in new_track_ids if tid in old_set]
+    common_in_old = [tid for tid in sp_ids_current if tid in new_set]
+    order_changed = common_in_new != common_in_old
 
     log.info(f"  + Agregar: {len(to_add)} | - Eliminar: {len(to_remove)} | ↕ Reordenar: {order_changed}")
 
     # 7. Aplicar cambios
-    # Siempre vaciamos y rellenamos en orden correcto para garantizar consistencia
-    clear_playlist(sp, sp_playlist_id, sp_tracks)
-    add_tracks(sp, sp_playlist_id, new_track_ids)
+    if order_changed:
+        # Hay reorden: más simple y seguro vaciar y reinsertar todo en el orden correcto
+        log.info("  ↕ Orden cambiado — vaciando y reinsertando.")
+        clear_playlist(sp, sp_playlist_id, sp_tracks)
+        metrics["tracks_removed"] += len(sp_tracks)
+        add_tracks(sp, sp_playlist_id, new_track_ids)
+    else:
+        # Sin reorden: cirugía — solo eliminar las sobrantes y añadir las nuevas al final
+        if to_remove:
+            log.info(f"  - Eliminando {len(to_remove)} canciones.")
+            remove_tracks(sp, sp_playlist_id, to_remove)
+        if to_add:
+            log.info(f"  + Agregando {len(to_add)} canciones al final.")
+            add_tracks(sp, sp_playlist_id, to_add)
 
     for tid in to_add:
         log.info(f"  + Agregada: {tid}")
@@ -314,6 +421,8 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
 
 
 def main():
+    start_time = time.time()
+
     if not os.path.exists("config.json"):
         log.error("No se encontró config.json. Corre setup_playlists.py primero.")
         sys.exit(1)
@@ -323,15 +432,32 @@ def main():
     if not playlists:
         log.error("config.json no tiene playlists configuradas.")
         sys.exit(1)
+
+    load_search_cache()
+
     log.info(f"Iniciando sincronización de {len(playlists)} playlist(s)...")
     youtube = get_youtube()
     sp      = get_spotify()
+
     for pl in playlists:
         try:
             sync_playlist(youtube, sp, pl["youtube_music_id"], pl["spotify_name"])
         except Exception as e:
             log.error(f"Error sincronizando '{pl.get('spotify_name')}': {e}")
+
+    save_search_cache()
+
+    elapsed = time.time() - start_time
     log.info("✅ Sincronización completa.")
+    log.info("─── Métricas ─────────────────────────────────")
+    log.info(f"  Spotify requests:   {metrics['spotify_requests']}")
+    log.info(f"  Search cache hits:  {metrics['cache_hits']}")
+    log.info(f"  Spotify searches:   {metrics['spotify_searches']}")
+    log.info(f"  Tracks added:       {metrics['tracks_added']}")
+    log.info(f"  Tracks removed:     {metrics['tracks_removed']}")
+    log.info(f"  Rate limit waits:   {metrics['rate_limit_waits']}")
+    log.info(f"  Tiempo total:       {elapsed:.1f}s")
+    log.info("──────────────────────────────────────────────")
 
 
 if __name__ == "__main__":
