@@ -9,7 +9,7 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repo
@@ -25,13 +25,11 @@ jobs:
 
       - name: Run sync
         env:
-          # YouTube Music
+          # YouTube Music (el JSON ya incluye client_id y client_secret)
           YTMUSIC_AUTH:          ${{ secrets.YTMUSIC_AUTH }}
-          YTMUSIC_CLIENT_ID:     ${{ secrets.YTMUSIC_CLIENT_ID }}
-          YTMUSIC_CLIENT_SECRET: ${{ secrets.YTMUSIC_CLIENT_SECRET }}
           # Spotify
           SPOTIFY_CLIENT_ID:     ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
           SPOTIFY_REDIRECT_URI:  ${{ secrets.SPOTIFY_REDIRECT_URI }}
-          SPOTIFY_CACHE_TOKEN:   ${{ secrets.SPOTIFY_CACHE_TOKEN }}
+          SPOTIFY_CACHE_TOKEN:   ${{ secrets.SPOTIFY_CACHE }}
         run: python sync.py

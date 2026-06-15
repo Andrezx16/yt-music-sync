@@ -10,6 +10,11 @@ import time
 import logging
 import requests
 
+
+class SpotifyRateLimitError(Exception):
+    """Spotify impuso un rate limit demasiado largo — abortar todas las búsquedas."""
+    pass
+
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from dotenv import load_dotenv
@@ -177,6 +182,10 @@ def search_spotify_track(sp, title: str, artist: str) -> str | None:
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
                 wait = int(e.response.headers.get("Retry-After", 5))
+                if wait > 60:
+                    raise SpotifyRateLimitError(
+                        f"Spotify rate limit de {wait}s — abortando búsquedas"
+                    )
                 log.warning(f"  Rate limit, esperando {wait}s...")
                 time.sleep(wait)
             else:
@@ -255,7 +264,13 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
         elif key_title in sp_map_title_only:
             new_track_ids.append(sp_map_title_only[key_title])
         else:
-            spotify_id = search_spotify_track(sp, track["title"], track["artist"])
+            try:
+                spotify_id = search_spotify_track(sp, track["title"], track["artist"])
+            except SpotifyRateLimitError as e:
+                log.warning(f"  ⏸ {e}")
+                log.warning("  Las canciones pendientes se procesarán en el próximo run.")
+                not_found.append(f"{track['artist']} — {track['title']} (pendiente)")
+                break  # Salir del loop completo, no solo saltar una canción
             if spotify_id:
                 new_track_ids.append(spotify_id)
                 sp_map_title_artist[key_full] = spotify_id
@@ -264,7 +279,7 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
             else:
                 not_found.append(f"{track['artist']} — {track['title']}")
                 log.warning(f"  ✗ No encontrada: {track['artist']} — {track['title']}")
-            time.sleep(0.2)
+            time.sleep(0.5)  # Pausa entre búsquedas para no saturar el rate limit
 
     # 5. Sin cambios
     if new_track_ids == sp_ids_current:
