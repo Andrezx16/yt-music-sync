@@ -1,0 +1,37 @@
+name: Sync YouTube Music → Spotify
+
+on:
+  schedule:
+    # 8:00 AM Colombia (UTC-5) = 13:00 UTC
+    - cron: "0 13 * * *"
+  workflow_dispatch:  # Permite ejecución manual desde la app de GitHub
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          # YouTube Music
+          YTMUSIC_AUTH:          ${{ secrets.YTMUSIC_AUTH }}
+          YTMUSIC_CLIENT_ID:     ${{ secrets.YTMUSIC_CLIENT_ID }}
+          YTMUSIC_CLIENT_SECRET: ${{ secrets.YTMUSIC_CLIENT_SECRET }}
+          # Spotify
+          SPOTIFY_CLIENT_ID:     ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          SPOTIFY_REDIRECT_URI:  ${{ secrets.SPOTIFY_REDIRECT_URI }}
+          SPOTIFY_CACHE_TOKEN:   ${{ secrets.SPOTIFY_CACHE_TOKEN }}
+        run: python sync.py

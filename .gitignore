@@ -1,0 +1,16 @@
+# Archivos de autenticación — NUNCA subir al repo
+ytmusic_auth.json
+.spotify_cache
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
