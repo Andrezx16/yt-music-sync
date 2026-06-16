@@ -441,7 +441,9 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
         except SpotifyRateLimitError as e:
             log.warning(f"  ⏸ {e}")
             log.warning("  Las canciones pendientes se procesarán en el próximo run.")
-            break
+            log.warning("  ⚠ Sync interrumpido — playlist sin cambios para evitar pérdida de datos.")
+            ytm_keys = {_cache_key(t["title"], t["artist"]) for t in ytm_tracks}
+            return pending, ytm_keys, ytm_tracks, True  # True = abortado
         if spotify_id:
             new_track_ids.append(spotify_id)
             sp_map_title_artist[(title, artist)] = spotify_id
@@ -458,8 +460,7 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
     if new_track_ids == sp_ids_current:
         log.info(f"  ✅ Sin cambios.")
         ytm_keys = {_cache_key(t["title"], t["artist"]) for t in ytm_tracks}
-        return pending, ytm_keys, ytm_tracks
-
+        return pending, ytm_keys, ytm_tracks, False  # False = completo
     # 6. Calcular diferencias
     new_set = set(new_track_ids)
     to_add    = [tid for tid in new_track_ids if tid not in old_set]
@@ -502,7 +503,7 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
             log.warning(f"    - {name}")
 
     ytm_keys = {_cache_key(t["title"], t["artist"]) for t in ytm_tracks}
-    return pending, ytm_keys, ytm_tracks
+    return pending, ytm_keys, ytm_tracks, False  # False = completo
 
 
 def main():
@@ -525,19 +526,25 @@ def main():
     youtube = get_youtube()
     sp      = get_spotify()
 
-    all_pending   = []
-    all_ytm_keys  = set()
+    all_pending    = []
+    all_ytm_keys   = set()
     all_ytm_tracks = []
+    any_aborted    = False
     for pl in playlists:
         try:
-            pending, ytm_keys, ytm_tracks = sync_playlist(youtube, sp, pl["youtube_music_id"], pl["spotify_name"])
+            pending, ytm_keys, ytm_tracks, aborted = sync_playlist(youtube, sp, pl["youtube_music_id"], pl["spotify_name"])
             all_pending.extend(pending)
             all_ytm_keys.update(ytm_keys)
             all_ytm_tracks.extend(ytm_tracks)
+            if aborted:
+                any_aborted = True
         except Exception as e:
             log.error(f"Error sincronizando '{pl.get('spotify_name')}': {e}")
 
-    clean_search_cache(all_ytm_keys)
+    if any_aborted:
+        log.warning("  ⚠ Al menos un sync fue interrumpido — cache no se limpiará para evitar pérdida de datos.")
+    else:
+        clean_search_cache(all_ytm_keys)
     save_search_cache()
     save_pending_review(all_pending)
 
