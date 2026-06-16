@@ -3,6 +3,8 @@ ytmusic_auth.json
 .spotify_cache
 .env
 spotify_search_cache.json
+pending_review.json
+ytm_tracks.json
 
 # Python
 __pycache__/

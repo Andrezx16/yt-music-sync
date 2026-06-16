@@ -55,6 +55,15 @@ def save_search_cache() -> None:
         json.dump(_search_cache, f, ensure_ascii=False, indent=2)
 
 
+def clean_search_cache(all_ytm_keys: set[str]) -> None:
+    """Elimina entradas del cache cuya canción ya no está en ninguna playlist de YTM."""
+    removed = [k for k in list(_search_cache) if k not in all_ytm_keys]
+    for k in removed:
+        del _search_cache[k]
+    if removed:
+        log.info(f"Cache limpiado: {len(removed)} entrada(s) huérfana(s) eliminadas")
+
+
 def _cache_key(title: str, artist: str) -> str:
     return f"{title.lower()}::{artist.lower()}"
 
@@ -71,6 +80,45 @@ def set_cached_track(title: str, artist: str, spotify_id: str | None) -> None:
     _search_cache[_cache_key(title, artist)] = spotify_id
 
 
+# ─── Manual matches ──────────────────────────────────────────────────────────
+# Decisiones manuales del usuario. Vive en el repo.
+# Formato: { "title::artist": "spotify_id" | "skip" }
+
+MANUAL_MATCHES_FILE = "manual_matches.json"
+PENDING_REVIEW_FILE = "pending_review.json"
+_manual_matches: dict = {}
+
+
+def load_manual_matches() -> None:
+    global _manual_matches
+    if os.path.exists(MANUAL_MATCHES_FILE):
+        with open(MANUAL_MATCHES_FILE, encoding="utf-8") as f:
+            _manual_matches = json.load(f)
+        log.info(f"Manual matches cargado: {len(_manual_matches)} entradas")
+    else:
+        _manual_matches = {}
+
+
+def get_manual_match(title: str, artist: str) -> tuple[bool, str | None]:
+    """Retorna (found, spotify_id_or_None). 'skip' se convierte en (True, None)."""
+    key = _cache_key(title, artist)
+    if key in _manual_matches:
+        val = _manual_matches[key]
+        return True, (None if val == "skip" else val)
+    return False, None
+
+
+def save_pending_review(pending: list[dict]) -> None:
+    """Guarda canciones pendientes de revisión manual (solo local)."""
+    if not pending:
+        if os.path.exists(PENDING_REVIEW_FILE):
+            os.remove(PENDING_REVIEW_FILE)
+        return
+    with open(PENDING_REVIEW_FILE, "w", encoding="utf-8") as f:
+        json.dump(pending, f, ensure_ascii=False, indent=2)
+    log.warning(f"  ⚠ {len(pending)} canción(es) pendientes de revisión → corre review.py")
+
+
 # ─── Métricas ────────────────────────────────────────────────────────────────
 
 metrics = {
@@ -80,6 +128,8 @@ metrics = {
     "tracks_added":     0,
     "tracks_removed":   0,
     "rate_limit_waits": 0,
+    "manual_matches":   0,
+    "skipped":          0,
 }
 
 
@@ -344,39 +394,71 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
             sp_map_title_only[title] = t["id"]
 
     # 4. Resolver IDs para cada track de YTM
-    not_found    = []
+    not_found     = []
+    pending       = []
     new_track_ids = []
 
     for track in ytm_tracks:
         title  = track["title"].lower()
         artist = track["artist"].lower()
 
+        # ── A. Match directo por título+artista o solo título ───────────────
         if (title, artist) in sp_map_title_artist:
             new_track_ids.append(sp_map_title_artist[(title, artist)])
-        elif title in sp_map_title_only:
+            continue
+        if title in sp_map_title_only:
             new_track_ids.append(sp_map_title_only[title])
-        else:
-            try:
-                spotify_id = search_spotify_track(sp, track["title"], track["artist"])
-            except SpotifyRateLimitError as e:
-                log.warning(f"  ⏸ {e}")
-                log.warning("  Las canciones pendientes se procesarán en el próximo run.")
-                not_found.append(f"{track['artist']} — {track['title']} (pendiente)")
-                break
-            if spotify_id:
-                new_track_ids.append(spotify_id)
-                sp_map_title_artist[(title, artist)] = spotify_id
-                sp_map_title_only[title] = spotify_id
-                log.info(f"  ✓ Nueva: {track['artist']} — {track['title']}")
+            continue
+
+        # ── B. Manual match (decisión tuya vía review.py) ──────────────────
+        in_manual, manual_id = get_manual_match(track["title"], track["artist"])
+        if in_manual:
+            if manual_id is None:
+                metrics["skipped"] += 1
+            else:
+                metrics["manual_matches"] += 1
+                new_track_ids.append(manual_id)
+            continue
+
+        # ── C. Cache de búsquedas automáticas ──────────────────────────────
+        in_cache, cached_id = get_cached_track(track["title"], track["artist"])
+        if in_cache:
+            metrics["cache_hits"] += 1
+            if cached_id:
+                new_track_ids.append(cached_id)
+                # Cache hit sin manual match = candidata a revisión
+                pending.append({"title": track["title"], "artist": track["artist"]})
+                log.info(f"  📦 Cache (revisar): {track['artist']} — {track['title']}")
             else:
                 not_found.append(f"{track['artist']} — {track['title']}")
+                pending.append({"title": track["title"], "artist": track["artist"]})
                 log.warning(f"  ✗ No encontrada: {track['artist']} — {track['title']}")
-            # ── Sin sleep fijo: el rate limit reactivo en search_spotify_track lo maneja
+            continue
+
+        # ── D. Búsqueda en Spotify ──────────────────────────────────────────
+        try:
+            spotify_id = search_spotify_track(sp, track["title"], track["artist"])
+        except SpotifyRateLimitError as e:
+            log.warning(f"  ⏸ {e}")
+            log.warning("  Las canciones pendientes se procesarán en el próximo run.")
+            break
+        if spotify_id:
+            new_track_ids.append(spotify_id)
+            sp_map_title_artist[(title, artist)] = spotify_id
+            sp_map_title_only[title] = spotify_id
+            # Nueva búsqueda = también candidata a revisión
+            pending.append({"title": track["title"], "artist": track["artist"]})
+            log.info(f"  ✓ Nueva (revisar): {track['artist']} — {track['title']}")
+        else:
+            not_found.append(f"{track['artist']} — {track['title']}")
+            pending.append({"title": track["title"], "artist": track["artist"]})
+            log.warning(f"  ✗ No encontrada: {track['artist']} — {track['title']}")
 
     # 5. Sin cambios
     if new_track_ids == sp_ids_current:
         log.info(f"  ✅ Sin cambios.")
-        return
+        ytm_keys = {_cache_key(t["title"], t["artist"]) for t in ytm_tracks}
+        return pending, ytm_keys, ytm_tracks
 
     # 6. Calcular diferencias
     new_set = set(new_track_ids)
@@ -419,6 +501,9 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
         for name in not_found:
             log.warning(f"    - {name}")
 
+    ytm_keys = {_cache_key(t["title"], t["artist"]) for t in ytm_tracks}
+    return pending, ytm_keys, ytm_tracks
+
 
 def main():
     start_time = time.time()
@@ -434,18 +519,31 @@ def main():
         sys.exit(1)
 
     load_search_cache()
+    load_manual_matches()
 
     log.info(f"Iniciando sincronización de {len(playlists)} playlist(s)...")
     youtube = get_youtube()
     sp      = get_spotify()
 
+    all_pending   = []
+    all_ytm_keys  = set()
+    all_ytm_tracks = []
     for pl in playlists:
         try:
-            sync_playlist(youtube, sp, pl["youtube_music_id"], pl["spotify_name"])
+            pending, ytm_keys, ytm_tracks = sync_playlist(youtube, sp, pl["youtube_music_id"], pl["spotify_name"])
+            all_pending.extend(pending)
+            all_ytm_keys.update(ytm_keys)
+            all_ytm_tracks.extend(ytm_tracks)
         except Exception as e:
             log.error(f"Error sincronizando '{pl.get('spotify_name')}': {e}")
 
+    clean_search_cache(all_ytm_keys)
     save_search_cache()
+    save_pending_review(all_pending)
+
+    # Guardar lista de canciones YTM para que review.py --clean pueda limpiar manual_matches
+    with open("ytm_tracks.json", "w", encoding="utf-8") as f:
+        json.dump(all_ytm_tracks, f, ensure_ascii=False, indent=2)
 
     elapsed = time.time() - start_time
     log.info("✅ Sincronización completa.")
@@ -453,6 +551,8 @@ def main():
     log.info(f"  Spotify requests:   {metrics['spotify_requests']}")
     log.info(f"  Search cache hits:  {metrics['cache_hits']}")
     log.info(f"  Spotify searches:   {metrics['spotify_searches']}")
+    log.info(f"  Manual matches:     {metrics['manual_matches']}")
+    log.info(f"  Skipped:            {metrics['skipped']}")
     log.info(f"  Tracks added:       {metrics['tracks_added']}")
     log.info(f"  Tracks removed:     {metrics['tracks_removed']}")
     log.info(f"  Rate limit waits:   {metrics['rate_limit_waits']}")
