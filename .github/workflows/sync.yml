@@ -2,8 +2,8 @@ name: Sync YouTube Music → Spotify
 
 on:
   schedule:
-    # 8:00 AM Colombia (UTC-5) = 13:00 UTC, cada 2 días
-    - cron: "0 13 */2 * *"
+    # 6:00 AM Colombia (UTC-5) = 14:00 UTC, cada día
+    - cron: "0 11 * * *"
   workflow_dispatch:  # Permite ejecución manual desde la app de GitHub
 
 jobs:
