@@ -1,6 +1,6 @@
 """
 review.py — Resolución manual de canciones pendientes de revisión.
-Lee pending_review.json, muestra opciones de Spotify, y guarda decisiones en manual_matches.json.
+Lee pending_review.json, muestra opciones de Spotify, y guarda decisiones directamente en Supabase.
 Corre siempre de manera local, nunca en GitHub Actions.
 """
 
@@ -10,16 +10,23 @@ import requests
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from dotenv import load_dotenv
+from supabase import create_client, Client
 
 load_dotenv()
 
 PENDING_REVIEW_FILE = "pending_review.json"
-MANUAL_MATCHES_FILE = "manual_matches.json"
 
+# ─── Inicialización de Supabase ──────────────────────────────────────────────
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+if SUPABASE_URL:
+    SUPABASE_URL = SUPABASE_URL.strip().rstrip('/')
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def _cache_key(title: str, artist: str) -> str:
     return f"{title.lower()}::{artist.lower()}"
-
 
 def get_spotify() -> spotipy.Spotify:
     cache_path = ".spotify_cache"
@@ -33,12 +40,10 @@ def get_spotify() -> spotipy.Spotify:
     )
     return spotipy.Spotify(auth_manager=auth_manager)
 
-
 def sp_headers(sp: spotipy.Spotify) -> dict:
     sp.auth_manager.validate_token(sp.auth_manager.get_cached_token())
     token = sp.auth_manager.get_cached_token()["access_token"]
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
 
 def search_options(sp: spotipy.Spotify, title: str, artist: str) -> list[dict]:
     """Busca 3 opciones en Spotify para una canción."""
@@ -79,19 +84,22 @@ def search_options(sp: spotipy.Spotify, title: str, artist: str) -> list[dict]:
         for t in items[:3]
     ]
 
-
 def load_manual_matches() -> dict:
-    if os.path.exists(MANUAL_MATCHES_FILE):
-        with open(MANUAL_MATCHES_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
+    try:
+        res = supabase.table("mapeos_manuales").select("nombre_busqueda", "spotify_id").limit(5000).execute()
+        return {fila["nombre_busqueda"]: fila["spotify_id"] for fila in res.data}
+    except Exception as e:
+        print(f"❌ Error al cargar mapeos manuales de Supabase: {e}")
+        return {}
 
 def save_manual_matches(matches: dict) -> None:
-    with open(MANUAL_MATCHES_FILE, "w", encoding="utf-8") as f:
-        json.dump(matches, f, ensure_ascii=False, indent=2)
-    print(f"\n✅ Guardado en {MANUAL_MATCHES_FILE}")
-
+    filas = [{"nombre_busqueda": k, "spotify_id": v} for k, v in matches.items()]
+    try:
+        print("⏳ Subiendo decisiones a la nube de Supabase...")
+        supabase.table("mapeos_manuales").upsert(filas).execute()
+        print("✅ Guardado exitosamente en la base de datos remota.")
+    except Exception as e:
+        print(f"❌ Error al guardar en Supabase: {e}")
 
 def review():
     if not os.path.exists(PENDING_REVIEW_FILE):
@@ -108,20 +116,22 @@ def review():
     manual_matches = load_manual_matches()
     sp = get_spotify()
 
-    # Filtrar las que ya tienen decisión en manual_matches
+    # Filtrar las que ya tienen decisión en Supabase
     to_review = [
         t for t in pending
         if _cache_key(t["title"], t["artist"]) not in manual_matches
     ]
 
     if not to_review:
-        print("✅ Todas las pendientes ya tienen decisión en manual_matches.json.")
+        print("✅ Todas las pendientes ya tienen decisión guardada en Supabase.")
         return
 
     print(f"\n🎵 {len(to_review)} canción(es) pendientes de revisión\n")
     print("─" * 60)
 
     saved = 0
+    new_decisions = {}
+    
     for i, track in enumerate(to_review, 1):
         title  = track["title"]
         artist = track["artist"]
@@ -130,7 +140,6 @@ def review():
         print(f"\n[{i}/{len(to_review)}] {artist} — {title}")
         print("─" * 60)
 
-        # Buscar opciones en Spotify
         print("  Buscando opciones en Spotify...")
         options = search_options(sp, title, artist)
 
@@ -155,24 +164,24 @@ def review():
 
             if choice in ("1", "2", "3") and int(choice) <= len(options):
                 chosen = options[int(choice) - 1]
-                manual_matches[key] = chosen["id"]
-                print(f"  ✅ Guardado: {chosen['artist']} — {chosen['name']}")
+                new_decisions[key] = chosen["id"]
+                print(f"  ✅ Seleccionado: {chosen['artist']} — {chosen['name']}")
                 saved += 1
                 break
 
             elif choice == "m":
                 spotify_id = input("  ID de Spotify: ").strip()
                 if spotify_id:
-                    manual_matches[key] = spotify_id
-                    print(f"  ✅ Guardado ID manual: {spotify_id}")
+                    new_decisions[key] = spotify_id
+                    print(f"  ✅ Seleccionado ID manual: {spotify_id}")
                     saved += 1
                     break
                 else:
                     print("  ID vacío, intenta de nuevo.")
 
             elif choice == "s":
-                manual_matches[key] = "skip"
-                print(f"  ⏭ Skip guardado.")
+                new_decisions[key] = "skip"
+                print(f"  ⏭ Skip seleccionado.")
                 saved += 1
                 break
 
@@ -184,15 +193,13 @@ def review():
                 print("  Opción inválida, intenta de nuevo.")
 
     if saved > 0:
-        save_manual_matches(manual_matches)
-        print(f"\n📝 {saved} decisión(es) guardadas en {MANUAL_MATCHES_FILE}")
-        print("   Commitea el archivo y en el próximo sync se aplicarán.")
+        save_manual_matches(new_decisions)
+        print(f"\n📝 {saved} decisión(es) subidas a Supabase con éxito.")
     else:
         print("\n  Sin cambios guardados.")
 
-
 def clean(ytm_tracks_file: str = "ytm_tracks.json") -> None:
-    """Elimina de manual_matches.json las entradas cuya canción ya no está en YTM."""
+    """Elimina de Supabase las entradas cuya canción ya no está en YTM."""
     if not os.path.exists(ytm_tracks_file):
         print(f"❌ No se encontró {ytm_tracks_file}. Corre sync.py primero.")
         return
@@ -203,24 +210,26 @@ def clean(ytm_tracks_file: str = "ytm_tracks.json") -> None:
     ytm_keys = {_cache_key(t["title"], t["artist"]) for t in ytm_tracks}
     manual_matches = load_manual_matches()
 
-    orphans = {k: v for k, v in manual_matches.items() if k not in ytm_keys}
+    orphans = [k for k in manual_matches if k not in ytm_keys]
     if not orphans:
-        print("✅ No hay entradas huérfanas en manual_matches.json.")
+        print("✅ No hay entradas huérfanas en Supabase.")
         return
 
-    print(f"\n🧹 {len(orphans)} entrada(s) huérfana(s) encontradas:\n")
-    for k, v in orphans.items():
-        print(f"  - {k} → {v}")
+    print(f"\n🧹 {len(orphans)} entrada(s) huérfana(s) encontradas en la nube:\n")
+    for k in orphans:
+        print(f"  - {k} → {manual_matches[k]}")
 
-    confirm = input("\n¿Eliminar estas entradas? (s/n): ").strip().lower()
+    confirm = input("\n¿Eliminar estas entradas de Supabase? (s/n): ").strip().lower()
     if confirm == "s":
         for k in orphans:
-            del manual_matches[k]
-        save_manual_matches(manual_matches)
-        print(f"✅ {len(orphans)} entrada(s) eliminadas.")
+            try:
+                supabase.table("mapeos_manuales").delete().eq("nombre_busqueda", k).execute()
+                print(f"  🗑️ Eliminado: {k}")
+            except Exception as e:
+                print(f"  ❌ No se pudo eliminar {k}: {e}")
+        print("✅ Proceso de limpieza finalizado.")
     else:
         print("  Cancelado.")
-
 
 if __name__ == "__main__":
     import sys

@@ -2,9 +2,9 @@ name: Sync YouTube Music → Spotify
 
 on:
   schedule:
-    # 6:00 AM Colombia (UTC-5) = 11:00 UTC, cada día
-    - cron: "0 11 * * *"
-  workflow_dispatch:  # Permite ejecución manual desde la app de GitHub
+    # Se ejecuta cada 3 horas (0, 3, 6, 9, 12, 15, 18, 21 hora UTC)
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
 
 jobs:
   sync:
@@ -23,26 +23,16 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Restaurar cache de búsquedas Spotify
-        uses: actions/cache@v4
-        with:
-          path: spotify_search_cache.json
-          key: spotify-search-cache
-
       - name: Run sync
         env:
-          # YouTube Music (el JSON ya incluye client_id y client_secret)
+          # YouTube Music
           YTMUSIC_AUTH:          ${{ secrets.YTMUSIC_AUTH }}
           # Spotify
           SPOTIFY_CLIENT_ID:     ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
           SPOTIFY_REDIRECT_URI:  ${{ secrets.SPOTIFY_REDIRECT_URI }}
           SPOTIFY_CACHE_TOKEN:   ${{ secrets.SPOTIFY_CACHE }}
+          # Supabase
+          SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:          ${{ secrets.SUPABASE_KEY }}
         run: python sync.py
-
-      - name: Subir cache como artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: spotify-search-cache
-          path: spotify_search_cache.json

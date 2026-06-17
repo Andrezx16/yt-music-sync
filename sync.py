@@ -1,6 +1,7 @@
 """
 sync.py — Sincroniza playlists de YouTube Music a Spotify.
 Usa YouTube Data API v3 oficial + requests directos a Spotify API.
+Ahora integrado 100% con Supabase para el caché y mapeos manuales.
 """
 
 import json
@@ -10,7 +11,6 @@ import time
 import random
 import logging
 import requests
-
 
 class SpotifyRateLimitError(Exception):
     """Spotify impuso un rate limit demasiado largo — abortar todas las búsquedas."""
@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from supabase import create_client, Client
 
 load_dotenv()
 
@@ -32,84 +33,87 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── Cache de búsquedas Spotify ──────────────────────────────────────────────
-# Persiste entre ejecuciones. Guarda también resultados negativos (None).
-# Formato: { "title::artist": "spotify_id" | null }
+# ─── Inicialización de Supabase ──────────────────────────────────────────────
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-SEARCH_CACHE_FILE = "spotify_search_cache.json"
-_search_cache: dict = {}  # cargado una vez en main(), actúa también como memoria temporal
+if SUPABASE_URL:
+    SUPABASE_URL = SUPABASE_URL.strip().rstrip('/')
 
+if not SUPABASE_URL or not SUPABASE_KEY:
+    log.error("Faltan las credenciales de SUPABASE_URL o SUPABASE_KEY en el archivo .env.")
+    sys.exit(1)
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ─── Cache de búsquedas Spotify (En la Nube) ─────────────────────────────────
+_search_cache: dict = {}
 
 def load_search_cache() -> None:
     global _search_cache
-    if os.path.exists(SEARCH_CACHE_FILE):
-        with open(SEARCH_CACHE_FILE, encoding="utf-8") as f:
-            _search_cache = json.load(f)
-        log.info(f"Cache cargado: {len(_search_cache)} entradas en {SEARCH_CACHE_FILE}")
-    else:
+    try:
+        res = supabase.table("canciones").select("nombre_busqueda", "spotify_id").limit(10000).execute()
+        _search_cache = {fila["nombre_busqueda"]: fila["spotify_id"] for fila in res.data}
+        log.info(f"Cache cargado desde Supabase: {len(_search_cache)} entradas.")
+    except Exception as e:
+        log.error(f"Error al cargar el caché desde Supabase: {e}")
         _search_cache = {}
 
 
-def save_search_cache() -> None:
-    with open(SEARCH_CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(_search_cache, f, ensure_ascii=False, indent=2)
-
-
 def clean_search_cache(all_ytm_keys: set[str]) -> None:
-    """Elimina entradas del cache cuya canción ya no está en ninguna playlist de YTM."""
-    removed = [k for k in list(_search_cache) if k not in all_ytm_keys]
-    for k in removed:
-        del _search_cache[k]
-    if removed:
-        log.info(f"Cache limpiado: {len(removed)} entrada(s) huérfana(s) eliminadas")
-
+    """Elimina del caché en la nube entradas cuya canción ya no está en YTM."""
+    removed_keys = [k for k in list(_search_cache) if k not in all_ytm_keys]
+    if not removed_keys:
+        return
+        
+    log.info(f"Limpiando caché en la nube: {len(removed_keys)} entradas huérfanas...")
+    for k in removed_keys:
+        try:
+            supabase.table("canciones").delete().eq("nombre_busqueda", k).execute()
+            del _search_cache[k]
+        except Exception as e:
+            log.warning(f"No se pudo eliminar {k} de Supabase: {e}")
 
 def _cache_key(title: str, artist: str) -> str:
     return f"{title.lower()}::{artist.lower()}"
 
-
 def get_cached_track(title: str, artist: str) -> tuple[bool, str | None]:
-    """Retorna (found_in_cache, spotify_id_or_None)."""
     key = _cache_key(title, artist)
     if key in _search_cache:
         return True, _search_cache[key]
     return False, None
 
-
 def set_cached_track(title: str, artist: str, spotify_id: str | None) -> None:
-    _search_cache[_cache_key(title, artist)] = spotify_id
+    key = _cache_key(title, artist)
+    _search_cache[key] = spotify_id
+    try:
+        supabase.table("canciones").upsert({"nombre_busqueda": key, "spotify_id": spotify_id}).execute()
+    except Exception as e:
+        log.warning(f"Error al persistir nueva búsqueda en Supabase: {e}")
 
-
-# ─── Manual matches ──────────────────────────────────────────────────────────
-# Decisiones manuales del usuario. Vive en el repo.
-# Formato: { "title::artist": "spotify_id" | "skip" }
-
-MANUAL_MATCHES_FILE = "manual_matches.json"
-PENDING_REVIEW_FILE = "pending_review.json"
+# ─── Manual matches (En la Nube) ─────────────────────────────────────────────
 _manual_matches: dict = {}
-
 
 def load_manual_matches() -> None:
     global _manual_matches
-    if os.path.exists(MANUAL_MATCHES_FILE):
-        with open(MANUAL_MATCHES_FILE, encoding="utf-8") as f:
-            _manual_matches = json.load(f)
-        log.info(f"Manual matches cargado: {len(_manual_matches)} entradas")
-    else:
+    try:
+        res = supabase.table("mapeos_manuales").select("nombre_busqueda", "spotify_id").limit(5000).execute()
+        _manual_matches = {fila["nombre_busqueda"]: fila["spotify_id"] for fila in res.data}
+        log.info(f"Manual matches cargados desde Supabase: {len(_manual_matches)} entradas.")
+    except Exception as e:
+        log.error(f"Error al cargar mapeos manuales desde Supabase: {e}")
         _manual_matches = {}
 
-
 def get_manual_match(title: str, artist: str) -> tuple[bool, str | None]:
-    """Retorna (found, spotify_id_or_None). 'skip' se convierte en (True, None)."""
     key = _cache_key(title, artist)
     if key in _manual_matches:
         val = _manual_matches[key]
         return True, (None if val == "skip" else val)
     return False, None
 
+PENDING_REVIEW_FILE = "pending_review.json"
 
 def save_pending_review(pending: list[dict]) -> None:
-    """Guarda canciones pendientes de revisión manual (solo local)."""
     if not pending:
         if os.path.exists(PENDING_REVIEW_FILE):
             os.remove(PENDING_REVIEW_FILE)
@@ -118,9 +122,7 @@ def save_pending_review(pending: list[dict]) -> None:
         json.dump(pending, f, ensure_ascii=False, indent=2)
     log.warning(f"  ⚠ {len(pending)} canción(es) pendientes de revisión → corre review.py")
 
-
 # ─── Métricas ────────────────────────────────────────────────────────────────
-
 metrics = {
     "spotify_requests": 0,
     "cache_hits":       0,
@@ -132,9 +134,7 @@ metrics = {
     "skipped":          0,
 }
 
-
 # ─── Autenticación YouTube ───────────────────────────────────────────────────
-
 def get_youtube():
     auth_file = "ytmusic_auth.json"
     raw = os.environ.get("YTMUSIC_AUTH")
@@ -161,9 +161,7 @@ def get_youtube():
             json.dump(token_data, f, indent=2)
     return build("youtube", "v3", credentials=creds)
 
-
 # ─── Autenticación Spotify ───────────────────────────────────────────────────
-
 def get_spotify():
     cache_path = ".spotify_cache"
     raw = os.environ.get("SPOTIFY_CACHE_TOKEN")
@@ -180,14 +178,11 @@ def get_spotify():
     )
     return spotipy.Spotify(auth_manager=auth_manager)
 
-
 # ─── Helpers Spotify ─────────────────────────────────────────────────────────
-
 def sp_headers(sp):
     sp.auth_manager.validate_token(sp.auth_manager.get_cached_token())
     token = sp.auth_manager.get_cached_token()["access_token"]
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
 
 def sp_get(sp, url, params=None):
     metrics["spotify_requests"] += 1
@@ -195,22 +190,18 @@ def sp_get(sp, url, params=None):
     r.raise_for_status()
     return r.json()
 
-
 def sp_post(sp, url, payload):
     metrics["spotify_requests"] += 1
     r = requests.post(url, headers=sp_headers(sp), json=payload)
     r.raise_for_status()
     return r.json()
 
-
 def sp_delete(sp, url, payload):
     metrics["spotify_requests"] += 1
     r = requests.delete(url, headers=sp_headers(sp), json=payload)
     r.raise_for_status()
 
-
 # ─── Helpers YouTube ─────────────────────────────────────────────────────────
-
 def get_youtube_tracks(youtube, playlist_id: str) -> list[dict]:
     tracks = []
     request = youtube.playlistItems().list(
@@ -229,9 +220,7 @@ def get_youtube_tracks(youtube, playlist_id: str) -> list[dict]:
         request = youtube.playlistItems().list_next(request, response)
     return tracks
 
-
 # ─── Helpers Spotify ─────────────────────────────────────────────────────────
-
 def get_or_create_spotify_playlist(sp, name: str) -> str:
     offset = 0
     while True:
@@ -250,7 +239,6 @@ def get_or_create_spotify_playlist(sp, name: str) -> str:
     log.info(f"  Playlist creada en Spotify: '{name}'")
     return pl["id"]
 
-
 def get_spotify_tracks(sp, playlist_id: str) -> list[dict]:
     tracks = []
     offset = 0
@@ -268,20 +256,12 @@ def get_spotify_tracks(sp, playlist_id: str) -> list[dict]:
         offset += 100
     return tracks
 
-
 def search_spotify_track(sp, title: str, artist: str) -> str | None:
-    """
-    Busca en Spotify con reintentos reactivos al 429.
-    Lee el cache antes de hacer cualquier request.
-    Guarda el resultado (positivo o negativo) en cache.
-    """
-    # ── 1. Consultar cache primero ──────────────────────────────────────────
     in_cache, cached_id = get_cached_track(title, artist)
     if in_cache:
         metrics["cache_hits"] += 1
         return cached_id
 
-    # ── 2. Llamar a Spotify ─────────────────────────────────────────────────
     metrics["spotify_searches"] += 1
     artist_clean = artist.replace(" - Topic", "").strip()
     query_strict = f"track:{title} artist:{artist_clean}" if artist_clean else f"track:{title}"
@@ -297,17 +277,15 @@ def search_spotify_track(sp, title: str, artist: str) -> str | None:
                 set_cached_track(title, artist, spotify_id)
                 return spotify_id
 
-            # Fallback: query libre
             result = sp_get(sp, "https://api.spotify.com/v1/search",
                             {"q": query_loose, "type": "track", "limit": 1})
             items = result["tracks"]["items"]
             spotify_id = items[0]["id"] if items else None
-            set_cached_track(title, artist, spotify_id)  # guarda también None
+            set_cached_track(title, artist, spotify_id) 
             return spotify_id
 
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
-                # ── Rate limit reactivo ─────────────────────────────────────
                 wait = int(e.response.headers.get("Retry-After", 5))
                 if wait > 60:
                     raise SpotifyRateLimitError(
@@ -318,7 +296,6 @@ def search_spotify_track(sp, title: str, artist: str) -> str | None:
                 metrics["rate_limit_waits"] += 1
                 log.warning(f"  Rate limit, esperando {total_wait:.1f}s...")
                 time.sleep(total_wait)
-                # Reintenta el mismo attempt (no incrementa)
                 continue
             else:
                 log.warning(f"  Error buscando '{title}': {e}")
@@ -333,9 +310,7 @@ def search_spotify_track(sp, title: str, artist: str) -> str | None:
     set_cached_track(title, artist, None)
     return None
 
-
 def clear_playlist(sp, playlist_id: str, current_tracks: list[dict]):
-    """Vacía la playlist eliminando todos los tracks actuales."""
     if not current_tracks:
         return
     base_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/items"
@@ -343,9 +318,7 @@ def clear_playlist(sp, playlist_id: str, current_tracks: list[dict]):
     for i in range(0, len(all_items), 100):
         sp_delete(sp, base_url, {"items": all_items[i:i+100]})
 
-
 def remove_tracks(sp, playlist_id: str, track_ids: list[str]):
-    """Elimina solo los tracks indicados (sin vaciar la playlist completa)."""
     if not track_ids:
         return
     base_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/items"
@@ -354,9 +327,7 @@ def remove_tracks(sp, playlist_id: str, track_ids: list[str]):
         sp_delete(sp, base_url, {"items": all_items[i:i+100]})
     metrics["tracks_removed"] += len(track_ids)
 
-
 def add_tracks(sp, playlist_id: str, track_ids: list[str]):
-    """Agrega tracks en orden (máximo 100 por request)."""
     if not track_ids:
         return
     base_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/items"
@@ -365,22 +336,17 @@ def add_tracks(sp, playlist_id: str, track_ids: list[str]):
         sp_post(sp, base_url, {"uris": chunk})
     metrics["tracks_added"] += len(track_ids)
 
-
 # ─── Sincronización ──────────────────────────────────────────────────────────
-
 def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
     log.info(f"▶ Sincronizando: '{spotify_name}'")
 
-    # 1. Obtener tracks de YouTube Music (fuente de verdad)
     ytm_tracks = get_youtube_tracks(youtube, ytm_id)
     log.info(f"  YouTube Music: {len(ytm_tracks)} canciones")
 
-    # 2. Obtener/crear playlist en Spotify
     sp_playlist_id = get_or_create_spotify_playlist(sp, spotify_name)
     sp_tracks = get_spotify_tracks(sp, sp_playlist_id)
     log.info(f"  Spotify actual: {len(sp_tracks)} canciones")
 
-    # 3. Mapas de tracks actuales en Spotify
     sp_ids_current = [t["id"] for t in sp_tracks]
     old_set = set(sp_ids_current)
 
@@ -393,8 +359,7 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
         if title not in sp_map_title_only:
             sp_map_title_only[title] = t["id"]
 
-    # 4. Resolver IDs para cada track de YTM
-    ADD_LIMIT     = 100  # Máximo canciones nuevas por run para evitar rate limit
+    ADD_LIMIT     = 100  
     not_found     = []
     pending       = []
     new_track_ids = []
@@ -403,7 +368,6 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
         title  = track["title"].lower()
         artist = track["artist"].lower()
 
-        # ── A. Match directo por título+artista o solo título ───────────────
         if (title, artist) in sp_map_title_artist:
             new_track_ids.append(sp_map_title_artist[(title, artist)])
             continue
@@ -411,7 +375,6 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
             new_track_ids.append(sp_map_title_only[title])
             continue
 
-        # ── B. Manual match (decisión tuya vía review.py) ──────────────────
         in_manual, manual_id = get_manual_match(track["title"], track["artist"])
         if in_manual:
             if manual_id is None:
@@ -421,13 +384,11 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
                 new_track_ids.append(manual_id)
             continue
 
-        # ── C. Cache de búsquedas automáticas ──────────────────────────────
         in_cache, cached_id = get_cached_track(track["title"], track["artist"])
         if in_cache:
             metrics["cache_hits"] += 1
             if cached_id:
                 new_track_ids.append(cached_id)
-                # Cache hit sin manual match = candidata a revisión
                 pending.append({"title": track["title"], "artist": track["artist"]})
                 log.info(f"  📦 Cache (revisar): {track['artist']} — {track['title']}")
             else:
@@ -436,14 +397,12 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
                 log.warning(f"  ✗ No encontrada: {track['artist']} — {track['title']}")
             continue
 
-        # ── D. Búsqueda en Spotify ──────────────────────────────────────────
         try:
             spotify_id = search_spotify_track(sp, track["title"], track["artist"])
         except SpotifyRateLimitError as e:
             log.warning(f"  ⏸ {e}")
             log.warning("  Las canciones pendientes se procesarán en el próximo run.")
             log.warning("  ⚠ Sync interrumpido — se agregarán las encontradas pero no se eliminará nada.")
-            # Agregar máximo 100 de las encontradas hasta ahora, sin eliminar nada
             to_add_partial = [tid for tid in new_track_ids if tid not in old_set]
             to_add_now     = to_add_partial[:ADD_LIMIT]
             if to_add_now:
@@ -456,7 +415,7 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
             if faltan > 0:
                 log.info(f"  ⏳ ~{faltan} canciones pendientes para el próximo run (Spotify: {len(sp_ids_current) + len(to_add_now)} / YTM: {len(ytm_tracks)})")
             ytm_keys = {_cache_key(t["title"], t["artist"]) for t in ytm_tracks}
-            return pending, ytm_keys, ytm_tracks, True  # True = abortado
+            return pending, ytm_keys, ytm_tracks, True  
         if spotify_id:
             new_track_ids.append(spotify_id)
             sp_map_title_artist[(title, artist)] = spotify_id
@@ -467,33 +426,27 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
             pending.append({"title": track["title"], "artist": track["artist"]})
             log.warning(f"  ✗ No encontrada: {track['artist']} — {track['title']}")
 
-    # 5. Sin cambios
     if new_track_ids == sp_ids_current:
         log.info(f"  ✅ Sin cambios.")
         ytm_keys = {_cache_key(t["title"], t["artist"]) for t in ytm_tracks}
-        return pending, ytm_keys, ytm_tracks, False  # False = completo
-    # 6. Calcular diferencias
+        return pending, ytm_keys, ytm_tracks, False  
+        
     new_set = set(new_track_ids)
     to_add    = [tid for tid in new_track_ids if tid not in old_set]
     to_remove = [tid for tid in sp_ids_current if tid not in new_set]
 
-    # Comparar orden relativo de las canciones comunes en ambas listas.
-    # Ignora las nuevas y las eliminadas — solo verifica si el orden cambió.
     common_in_new = [tid for tid in new_track_ids if tid in old_set]
     common_in_old = [tid for tid in sp_ids_current if tid in new_set]
     order_changed = common_in_new != common_in_old
 
     log.info(f"  + Agregar: {len(to_add)} | - Eliminar: {len(to_remove)} | ↕ Reordenar: {order_changed}")
 
-    # 7. Aplicar cambios
     if order_changed:
-        # Hay reorden: vaciar y reinsertar todo en el orden correcto — sin límite
         log.info("  ↕ Orden cambiado — vaciando y reinsertando.")
         clear_playlist(sp, sp_playlist_id, sp_tracks)
         metrics["tracks_removed"] += len(sp_tracks)
         add_tracks(sp, sp_playlist_id, new_track_ids)
     else:
-        # Sin reorden: eliminar sin límite, agregar máximo 100 por run
         if to_remove:
             log.info(f"  - Eliminando {len(to_remove)} canciones.")
             remove_tracks(sp, sp_playlist_id, to_remove)
@@ -520,8 +473,7 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
             log.warning(f"    - {name}")
 
     ytm_keys = {_cache_key(t["title"], t["artist"]) for t in ytm_tracks}
-    return pending, ytm_keys, ytm_tracks, False  # False = completo
-
+    return pending, ytm_keys, ytm_tracks, False  
 
 def main():
     start_time = time.time()
@@ -562,10 +514,8 @@ def main():
         log.warning("  ⚠ Al menos un sync fue interrumpido — cache no se limpiará para evitar pérdida de datos.")
     else:
         clean_search_cache(all_ytm_keys)
-    save_search_cache()
     save_pending_review(all_pending)
 
-    # Guardar lista de canciones YTM para que review.py --clean pueda limpiar manual_matches
     with open("ytm_tracks.json", "w", encoding="utf-8") as f:
         json.dump(all_ytm_tracks, f, ensure_ascii=False, indent=2)
 
@@ -582,7 +532,6 @@ def main():
     log.info(f"  Rate limit waits:   {metrics['rate_limit_waits']}")
     log.info(f"  Tiempo total:       {elapsed:.1f}s")
     log.info("──────────────────────────────────────────────")
-
 
 if __name__ == "__main__":
     main()

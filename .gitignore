@@ -5,6 +5,10 @@ ytmusic_auth.json
 spotify_search_cache.json
 pending_review.json
 ytm_tracks.json
+manual_matches.json
+migracion.py
+descargar_json.py
+
 
 # Python
 __pycache__/
