@@ -394,6 +394,7 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
             sp_map_title_only[title] = t["id"]
 
     # 4. Resolver IDs para cada track de YTM
+    ADD_LIMIT     = 100  # Máximo canciones nuevas por run para evitar rate limit
     not_found     = []
     pending       = []
     new_track_ids = []
@@ -441,16 +442,26 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
         except SpotifyRateLimitError as e:
             log.warning(f"  ⏸ {e}")
             log.warning("  Las canciones pendientes se procesarán en el próximo run.")
-            log.warning("  ⚠ Sync interrumpido — playlist sin cambios para evitar pérdida de datos.")
+            log.warning("  ⚠ Sync interrumpido — se agregarán las encontradas pero no se eliminará nada.")
+            # Agregar máximo 100 de las encontradas hasta ahora, sin eliminar nada
+            to_add_partial = [tid for tid in new_track_ids if tid not in old_set]
+            to_add_now     = to_add_partial[:ADD_LIMIT]
+            if to_add_now:
+                if len(to_add_partial) > ADD_LIMIT:
+                    log.info(f"  + Agregando {len(to_add_now)} de {len(to_add_partial)} canciones (límite por run).")
+                else:
+                    log.info(f"  + Agregando {len(to_add_now)} canciones encontradas antes del corte.")
+                add_tracks(sp, sp_playlist_id, to_add_now)
+            faltan = len(ytm_tracks) - (len(sp_ids_current) + len(to_add_now))
+            if faltan > 0:
+                log.info(f"  ⏳ ~{faltan} canciones pendientes para el próximo run (Spotify: {len(sp_ids_current) + len(to_add_now)} / YTM: {len(ytm_tracks)})")
             ytm_keys = {_cache_key(t["title"], t["artist"]) for t in ytm_tracks}
             return pending, ytm_keys, ytm_tracks, True  # True = abortado
         if spotify_id:
             new_track_ids.append(spotify_id)
             sp_map_title_artist[(title, artist)] = spotify_id
             sp_map_title_only[title] = spotify_id
-            # Nueva búsqueda = también candidata a revisión
-            pending.append({"title": track["title"], "artist": track["artist"]})
-            log.info(f"  ✓ Nueva (revisar): {track['artist']} — {track['title']}")
+            log.info(f"  ✓ Nueva: {track['artist']} — {track['title']}")
         else:
             not_found.append(f"{track['artist']} — {track['title']}")
             pending.append({"title": track["title"], "artist": track["artist"]})
@@ -476,19 +487,25 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
 
     # 7. Aplicar cambios
     if order_changed:
-        # Hay reorden: más simple y seguro vaciar y reinsertar todo en el orden correcto
+        # Hay reorden: vaciar y reinsertar todo en el orden correcto — sin límite
         log.info("  ↕ Orden cambiado — vaciando y reinsertando.")
         clear_playlist(sp, sp_playlist_id, sp_tracks)
         metrics["tracks_removed"] += len(sp_tracks)
         add_tracks(sp, sp_playlist_id, new_track_ids)
     else:
-        # Sin reorden: cirugía — solo eliminar las sobrantes y añadir las nuevas al final
+        # Sin reorden: eliminar sin límite, agregar máximo 100 por run
         if to_remove:
             log.info(f"  - Eliminando {len(to_remove)} canciones.")
             remove_tracks(sp, sp_playlist_id, to_remove)
         if to_add:
-            log.info(f"  + Agregando {len(to_add)} canciones al final.")
-            add_tracks(sp, sp_playlist_id, to_add)
+            to_add_now     = to_add[:ADD_LIMIT]
+            to_add_pending = to_add[ADD_LIMIT:]
+            if to_add_pending:
+                log.info(f"  + Agregando {len(to_add_now)} de {len(to_add)} canciones (límite por run).")
+                log.info(f"  ⏳ {len(to_add_pending)} canciones pendientes para el próximo run.")
+            else:
+                log.info(f"  + Agregando {len(to_add_now)} canciones al final.")
+            add_tracks(sp, sp_playlist_id, to_add_now)
 
     for tid in to_add:
         log.info(f"  + Agregada: {tid}")
