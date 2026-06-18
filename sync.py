@@ -337,7 +337,7 @@ def add_tracks(sp, playlist_id: str, track_ids: list[str]):
     metrics["tracks_added"] += len(track_ids)
 
 # ─── Sincronización ──────────────────────────────────────────────────────────
-def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
+def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str, searches_done: list):
     log.info(f"▶ Sincronizando: '{spotify_name}'")
 
     ytm_tracks = get_youtube_tracks(youtube, ytm_id)
@@ -359,7 +359,9 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
         if title not in sp_map_title_only:
             sp_map_title_only[title] = t["id"]
 
-    ADD_LIMIT     = 100  
+    ADD_LIMIT      = 100
+    SEARCH_LIMIT   = 100
+    search_skipped = 0
     not_found     = []
     pending       = []
     new_track_ids = []
@@ -397,8 +399,13 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
                 log.warning(f"  ✗ No encontrada: {track['artist']} — {track['title']}")
             continue
 
+        if searches_done[0] >= SEARCH_LIMIT:
+            search_skipped += 1
+            continue
+
         try:
             spotify_id = search_spotify_track(sp, track["title"], track["artist"])
+            searches_done[0] += 1
         except SpotifyRateLimitError as e:
             log.warning(f"  ⏸ {e}")
             log.warning("  Las canciones pendientes se procesarán en el próximo run.")
@@ -427,6 +434,8 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
             log.warning(f"  ✗ No encontrada: {track['artist']} — {track['title']}")
 
     if new_track_ids == sp_ids_current:
+        if search_skipped:
+            log.info(f"  ⏳ {search_skipped} canción(es) pendientes para el próximo run (límite de búsquedas alcanzado).")
         log.info(f"  ✅ Sin cambios.")
         ytm_keys = {_cache_key(t["title"], t["artist"]) for t in ytm_tracks}
         return pending, ytm_keys, ytm_tracks, False  
@@ -465,6 +474,8 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str):
     for tid in to_remove:
         log.info(f"  - Eliminada: {tid}")
 
+    if search_skipped:
+        log.info(f"  ⏳ {search_skipped} canción(es) pendientes para el próximo run (límite de búsquedas alcanzado).")
     log.info(f"  ✅ Sincronización completa: {len(new_track_ids)} canciones")
 
     if not_found:
@@ -499,9 +510,10 @@ def main():
     all_ytm_keys   = set()
     all_ytm_tracks = []
     any_aborted    = False
+    searches_done  = [0]  # contador compartido entre playlists
     for pl in playlists:
         try:
-            pending, ytm_keys, ytm_tracks, aborted = sync_playlist(youtube, sp, pl["youtube_music_id"], pl["spotify_name"])
+            pending, ytm_keys, ytm_tracks, aborted = sync_playlist(youtube, sp, pl["youtube_music_id"], pl["spotify_name"], searches_done)
             all_pending.extend(pending)
             all_ytm_keys.update(ytm_keys)
             all_ytm_tracks.extend(ytm_tracks)
