@@ -176,6 +176,19 @@ def get_spotify():
         cache_path=cache_path,
         open_browser=False,
     )
+    try:
+        token = auth_manager.get_cached_token()
+        if token and auth_manager.is_token_expired(token):
+            auth_manager.refresh_access_token(token["refresh_token"])
+    except Exception as e:
+        if "invalid_grant" in str(e).lower():
+            log.error("❌ El refresh token de Spotify expiró (>6 meses sin uso).")
+            log.error("   Para solucionarlo:")
+            log.error("   1. Corre setup_spotify.py localmente.")
+            log.error("   2. Copia el contenido de .spotify_cache.")
+            log.error("   3. Actualiza el secret SPOTIFY_CACHE en GitHub Actions.")
+            sys.exit(1)
+        raise
     return spotipy.Spotify(auth_manager=auth_manager)
 
 # ─── Helpers Spotify ─────────────────────────────────────────────────────────
