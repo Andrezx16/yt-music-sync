@@ -1,9 +1,6 @@
 name: Sync YouTube Music → Spotify
 
 on:
-  schedule:
-    # Cada 3 horas
-    - cron: "0 */3 * * *"
   workflow_dispatch:
 
 jobs:
