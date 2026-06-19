@@ -28,6 +28,27 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 def _cache_key(title: str, artist: str) -> str:
     return f"{title.lower()}::{artist.lower()}"
 
+def parse_spotify_id(val: str) -> str | None:
+    val = val.strip()
+    if not val:
+        return None
+    # Si es una URL de Spotify, e.g., https://open.spotify.com/track/6Yk1zG1V6VVYeUedec2TqU?si=xxxx
+    if "open.spotify.com/track/" in val:
+        parts = val.split("open.spotify.com/track/")
+        if len(parts) > 1:
+            id_part = parts[1].split("?")[0].split("/")[0]
+            if len(id_part) == 22:
+                return id_part
+    # Si es uri: spotify:track:6Yk1zG1V6VVYeUedec2TqU
+    if val.startswith("spotify:track:"):
+        id_part = val.split("spotify:track:")[1]
+        if len(id_part) == 22:
+            return id_part
+    # Si es el ID directo
+    if len(val) == 22:
+        return val
+    return None
+
 def get_spotify() -> spotipy.Spotify:
     cache_path = ".spotify_cache"
     auth_manager = SpotifyOAuth(
@@ -92,6 +113,14 @@ def load_manual_matches() -> dict:
         print(f"❌ Error al cargar mapeos manuales de Supabase: {e}")
         return {}
 
+def load_search_cache() -> dict:
+    try:
+        res = supabase.table("canciones").select("nombre_busqueda", "spotify_id").limit(10000).execute()
+        return {fila["nombre_busqueda"]: fila["spotify_id"] for fila in res.data}
+    except Exception as e:
+        print(f"❌ Error al cargar caché automático de Supabase: {e}")
+        return {}
+
 def save_manual_matches(matches: dict) -> None:
     filas = [{"nombre_busqueda": k, "spotify_id": v} for k, v in matches.items()]
     try:
@@ -114,6 +143,7 @@ def review():
         return
 
     manual_matches = load_manual_matches()
+    search_cache = load_search_cache()
     sp = get_spotify()
 
     # Filtrar las que ya tienen decisión en Supabase
@@ -132,71 +162,144 @@ def review():
     saved = 0
     new_decisions = {}
     
-    for i, track in enumerate(to_review, 1):
-        title  = track["title"]
-        artist = track["artist"]
-        key    = _cache_key(title, artist)
+    try:
+        for i, track in enumerate(to_review, 1):
+            title  = track["title"]
+            artist = track["artist"]
+            key    = _cache_key(title, artist)
+            cached_id = search_cache.get(key)
 
-        print(f"\n[{i}/{len(to_review)}] {artist} — {title}")
-        print("─" * 60)
+            print(f"\n[{i}/{len(to_review)}] {artist} — {title}")
+            if cached_id:
+                print(f"  ID actual en caché: {cached_id}")
+            else:
+                print("  ID actual en caché: (ninguno / no encontrada)")
+            print("─" * 60)
 
-        print("  Buscando opciones en Spotify...")
-        options = search_options(sp, title, artist)
+            should_exit = False
+            while True:
+                print("\n  Opciones:")
+                if cached_id:
+                    print("    [Enter] → Aceptar ID actual en caché")
+                print("    b       → Buscar 3 opciones en Spotify")
+                print("    m       → Ingresar ID de Spotify manualmente")
+                print("    s       → Skip (no sincronizar esta canción)")
+                print("    n       → Dejar para después (siguiente track)")
+                print("    q       → Guardar decisiones tomadas y salir")
 
-        if options:
-            for j, opt in enumerate(options, 1):
-                print(f"  {j}. {opt['artist']} — {opt['name']}")
-                print(f"     Album: {opt['album']}")
-                print(f"     {opt['url']}")
-        else:
-            print("  (sin resultados en Spotify)")
+                choice = input("\n  Tu elección: ").strip().lower()
 
-        print()
-        print("  Opciones:")
-        for j in range(1, len(options) + 1):
-            print(f"    {j} → elegir opción {j}")
-        print("    m → ingresar ID de Spotify manualmente")
-        print("    s → skip (no sincronizar esta canción)")
-        print("    n → dejar para después (siguiente run)")
+                if choice == "q":
+                    should_exit = True
+                    break
 
-        while True:
-            choice = input("\n  Tu elección: ").strip().lower()
+                if choice == "" and cached_id:
+                    new_decisions[key] = cached_id
+                    print(f"  ✅ Aceptado ID en caché: {cached_id}")
+                    saved += 1
+                    break
 
-            if choice in ("1", "2", "3") and int(choice) <= len(options):
-                chosen = options[int(choice) - 1]
-                new_decisions[key] = chosen["id"]
-                print(f"  ✅ Seleccionado: {chosen['artist']} — {chosen['name']}")
-                saved += 1
-                break
+                elif choice == "b":
+                    print("  Buscando opciones en Spotify...")
+                    options = search_options(sp, title, artist)
 
-            elif choice == "m":
-                spotify_id = input("  ID de Spotify: ").strip()
-                if spotify_id:
+                    if options:
+                        print("\n  Resultados encontrados:")
+                        for j, opt in enumerate(options, 1):
+                            print(f"    {j}. {opt['artist']} — {opt['name']}")
+                            print(f"       Album: {opt['album']}")
+                            print(f"       {opt['url']}")
+                        
+                        print("\n  Opciones de búsqueda:")
+                        for j in range(1, len(options) + 1):
+                            print(f"    {j} → elegir opción {j}")
+                        print("    m → ingresar ID de Spotify manualmente")
+                        print("    s → skip (no sincronizar esta canción)")
+                        print("    n → dejar para después (siguiente track)")
+                        print("    q → guardar decisiones tomadas y salir")
+                        print("    v → volver al menú anterior")
+
+                        sub_choice_valid = False
+                        while not sub_choice_valid:
+                            sub_choice = input("\n  Tu elección (de búsqueda): ").strip().lower()
+                            if sub_choice in ("1", "2", "3") and int(sub_choice) <= len(options):
+                                chosen = options[int(sub_choice) - 1]
+                                new_decisions[key] = chosen["id"]
+                                print(f"  ✅ Seleccionado: {chosen['artist']} — {chosen['name']}")
+                                saved += 1
+                                sub_choice_valid = True
+                                break
+                            elif sub_choice == "m":
+                                choice = "m"  # pasar al prompt manual
+                                sub_choice_valid = True
+                            elif sub_choice == "s":
+                                choice = "s"  # pasar a skip
+                                sub_choice_valid = True
+                            elif sub_choice == "n":
+                                choice = "n"  # pasar a next
+                                sub_choice_valid = True
+                            elif sub_choice == "q":
+                                choice = "q"
+                                should_exit = True
+                                sub_choice_valid = True
+                            elif sub_choice == "v":
+                                sub_choice_valid = True
+                                continue
+                            else:
+                                print("  Opción inválida, intenta de nuevo.")
+                        
+                        if key in new_decisions:
+                            break
+                        if should_exit:
+                            break
+                    else:
+                        print("  ❌ Sin resultados en Spotify.")
+                        continue
+
+                elif choice == "m":
+                    raw_input = input("  ID o Link de Spotify: ").strip()
+                    if raw_input:
+                        # Si pegaste el link completo, extraemos el ID que está entre '/track/' y el '?'
+                        if "spotify.com/track/" in raw_input:
+                            try:
+                                # Cortamos lo que está antes del ID y nos quedamos con el resto
+                                spotify_id = raw_input.split("spotify.com/track/")[1]
+                                # Si tiene parámetros de rastreo (?si=...), los eliminamos
+                                spotify_id = spotify_id.split("?")[0]
+                            except IndexError:
+                                spotify_id = raw_input # Por si pasa algo raro, dejamos el input original
+                    else:
+                        spotify_id = raw_input # Si ya era un ID limpio, lo dejamos igual
+
                     new_decisions[key] = spotify_id
                     print(f"  ✅ Seleccionado ID manual: {spotify_id}")
                     saved += 1
                     break
-                else:
-                    print("  ID vacío, intenta de nuevo.")
 
-            elif choice == "s":
-                new_decisions[key] = "skip"
-                print(f"  ⏭ Skip seleccionado.")
-                saved += 1
+                elif choice == "s":
+                    new_decisions[key] = "skip"
+                    print(f"  ⏭ Skip seleccionado.")
+                    saved += 1
+                    break
+
+                elif choice == "n":
+                    print("  ⏩ Dejado para después.")
+                    break
+
+                elif choice != "":
+                    print("  Opción inválida, intenta de nuevo.")
+
+            if should_exit:
                 break
-
-            elif choice == "n":
-                print("  ⏩ Dejado para después.")
-                break
-
-            else:
-                print("  Opción inválida, intenta de nuevo.")
+    except KeyboardInterrupt:
+        print("\n\n  👋 Saliendo y guardando progreso...")
 
     if saved > 0:
         save_manual_matches(new_decisions)
         print(f"\n📝 {saved} decisión(es) subidas a Supabase con éxito.")
     else:
         print("\n  Sin cambios guardados.")
+
 
 def clean(ytm_tracks_file: str = "ytm_tracks.json") -> None:
     """Elimina de Supabase las entradas cuya canción ya no está en YTM."""

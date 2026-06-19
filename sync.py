@@ -77,10 +77,23 @@ def clean_search_cache(all_ytm_keys: set[str]) -> None:
 def _cache_key(title: str, artist: str) -> str:
     return f"{title.lower()}::{artist.lower()}"
 
-def get_cached_track(title: str, artist: str) -> tuple[bool, str | None]:
+def get_cached_track(title: str, artist: str, title_conflicts: set[str] | None = None) -> tuple[bool, str | None]:
+    # 1. Match exacto título + artista
     key = _cache_key(title, artist)
     if key in _search_cache:
         return True, _search_cache[key]
+    # 2. Fallback: solo título — SOLO si:
+    #    a) ese título aparece una única vez en el caché (artistas distintos → ambiguo), Y
+    #    b) el título no tiene múltiples canciones en el batch actual de YTM.
+    #    Sin (b), cuando el caché tiene una sola entrada para ese título pero YTM tiene
+    #    varias canciones homónimas de artistas distintos, todas recibirían el mismo ID.
+    title_lower = title.lower()
+    if title_conflicts and title_lower in title_conflicts:
+        return False, None
+    matches = [(k, v) for k, v in _search_cache.items()
+               if k.split("::")[0] == title_lower]
+    if len(matches) == 1:
+        return True, matches[0][1]
     return False, None
 
 def set_cached_track(title: str, artist: str, spotify_id: str | None) -> None:
@@ -269,8 +282,8 @@ def get_spotify_tracks(sp, playlist_id: str) -> list[dict]:
         offset += 100
     return tracks
 
-def search_spotify_track(sp, title: str, artist: str) -> str | None:
-    in_cache, cached_id = get_cached_track(title, artist)
+def search_spotify_track(sp, title: str, artist: str, title_conflicts: set[str] | None = None) -> str | None:
+    in_cache, cached_id = get_cached_track(title, artist, title_conflicts)
     if in_cache:
         metrics["cache_hits"] += 1
         return cached_id
@@ -365,11 +378,19 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str, searches_done: li
 
     sp_map_title_artist = {}
     sp_map_title_only   = {}
+
+    # Contar cuántas canciones de Spotify comparten el mismo título,
+    # para evitar matches ambiguos cuando hay artistas distintos con igual título.
+    title_counts = {}
+    for t in sp_tracks:
+        title = t["name"].lower()
+        title_counts[title] = title_counts.get(title, 0) + 1
+
     for t in sp_tracks:
         title        = t["name"].lower()
         first_artist = t["artist"].split(",")[0].strip().lower()
         sp_map_title_artist[(title, first_artist)] = t["id"]
-        if title not in sp_map_title_only:
+        if title_counts[title] == 1:
             sp_map_title_only[title] = t["id"]
 
     ADD_LIMIT      = 100
@@ -379,6 +400,16 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str, searches_done: li
     pending       = []
     new_track_ids = []
 
+    # Títulos que aparecen más de una vez en el batch YTM actual (con artistas distintos).
+    # Usados para deshabilitar el fallback por-título del caché cuando sería ambiguo.
+    ytm_title_counts: dict[str, set[str]] = {}
+    for t in ytm_tracks:
+        tl = t["title"].lower()
+        ytm_title_counts.setdefault(tl, set()).add(t["artist"].lower())
+    title_conflicts = {tl for tl, artists in ytm_title_counts.items() if len(artists) > 1}
+    if title_conflicts:
+        log.debug(f"  Títulos con artistas distintos en YTM (fallback caché desactivado): {title_conflicts}")
+
     for track in ytm_tracks:
         title  = track["title"].lower()
         artist = track["artist"].lower()
@@ -386,7 +417,7 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str, searches_done: li
         if (title, artist) in sp_map_title_artist:
             new_track_ids.append(sp_map_title_artist[(title, artist)])
             continue
-        if title in sp_map_title_only:
+        if title in sp_map_title_only and title not in title_conflicts:
             new_track_ids.append(sp_map_title_only[title])
             continue
 
@@ -399,7 +430,7 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str, searches_done: li
                 new_track_ids.append(manual_id)
             continue
 
-        in_cache, cached_id = get_cached_track(track["title"], track["artist"])
+        in_cache, cached_id = get_cached_track(track["title"], track["artist"], title_conflicts)
         if in_cache:
             metrics["cache_hits"] += 1
             if cached_id:
@@ -417,7 +448,7 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str, searches_done: li
             continue
 
         try:
-            spotify_id = search_spotify_track(sp, track["title"], track["artist"])
+            spotify_id = search_spotify_track(sp, track["title"], track["artist"], title_conflicts)
             searches_done[0] += 1
         except SpotifyRateLimitError as e:
             log.warning(f"  ⏸ {e}")
@@ -439,12 +470,31 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str, searches_done: li
         if spotify_id:
             new_track_ids.append(spotify_id)
             sp_map_title_artist[(title, artist)] = spotify_id
-            sp_map_title_only[title] = spotify_id
+            # Solo agregar al mapa de solo-título si no genera ambigüedad
+            if title not in title_conflicts:
+                if title not in sp_map_title_only:
+                    sp_map_title_only[title] = spotify_id
+                elif sp_map_title_only[title] != spotify_id:
+                    # Mismo título, ID distinto → ambiguo, quitar del mapa de solo-título
+                    del sp_map_title_only[title]
             log.info(f"  ✓ Nueva: {track['artist']} — {track['title']}")
         else:
             not_found.append(f"{track['artist']} — {track['title']}")
             pending.append({"title": track["title"], "artist": track["artist"]})
             log.warning(f"  ✗ No encontrada: {track['artist']} — {track['title']}")
+
+    # Bug 2 fix: deduplicar new_track_ids preservando el orden antes de cualquier
+    # comparación o envío a Spotify. Sin esto, IDs repetidos causan duplicados en la
+    # playlist cuando order_changed=True (clear + reinsert con lista sin deduplicar).
+    seen: set[str] = set()
+    deduped_track_ids: list[str] = []
+    for tid in new_track_ids:
+        if tid not in seen:
+            seen.add(tid)
+            deduped_track_ids.append(tid)
+    if len(deduped_track_ids) < len(new_track_ids):
+        log.warning(f"  ⚠ {len(new_track_ids) - len(deduped_track_ids)} ID(s) duplicado(s) en new_track_ids — eliminados antes de sincronizar.")
+    new_track_ids = deduped_track_ids
 
     if new_track_ids == sp_ids_current:
         if search_skipped:
