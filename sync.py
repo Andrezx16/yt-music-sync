@@ -52,6 +52,7 @@ _search_cache: dict = {}
 def load_search_cache() -> None:
     global _search_cache
     try:
+        from datetime import datetime, timezone, timedelta
         res = supabase.table("canciones").select("nombre_busqueda", "spotify_id").limit(10000).execute()
         _search_cache = {fila["nombre_busqueda"]: fila["spotify_id"] for fila in res.data}
         log.info(f"Cache cargado desde Supabase: {len(_search_cache)} entradas.")
@@ -59,20 +60,6 @@ def load_search_cache() -> None:
         log.error(f"Error al cargar el caché desde Supabase: {e}")
         _search_cache = {}
 
-
-def clean_search_cache(all_ytm_keys: set[str]) -> None:
-    """Elimina del caché en la nube entradas cuya canción ya no está en YTM."""
-    removed_keys = [k for k in list(_search_cache) if k not in all_ytm_keys]
-    if not removed_keys:
-        return
-        
-    log.info(f"Limpiando caché en la nube: {len(removed_keys)} entradas huérfanas...")
-    for k in removed_keys:
-        try:
-            supabase.table("canciones").delete().eq("nombre_busqueda", k).execute()
-            del _search_cache[k]
-        except Exception as e:
-            log.warning(f"No se pudo eliminar {k} de Supabase: {e}")
 
 def _cache_key(title: str, artist: str) -> str:
     return f"{title.lower()}::{artist.lower()}"
@@ -210,22 +197,45 @@ def sp_headers(sp):
     token = sp.auth_manager.get_cached_token()["access_token"]
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-def sp_get(sp, url, params=None):
+MAX_RATE_LIMIT_WAIT = 60  # segundos — si Spotify pide esperar más, se aborta
+
+def _sp_request(sp, method, url, params=None, payload=None):
+    """Wrapper común para GET/POST/DELETE con manejo de rate limit."""
     metrics["spotify_requests"] += 1
-    r = requests.get(url, headers=sp_headers(sp), params=params or {})
-    r.raise_for_status()
-    return r.json()
+    for attempt in range(4):
+        hdrs = sp_headers(sp)
+        if method == "GET":
+            r = requests.get(url, headers=hdrs, params=params or {})
+        elif method == "POST":
+            r = requests.post(url, headers=hdrs, json=payload)
+        else:  # DELETE
+            r = requests.delete(url, headers=hdrs, json=payload)
+
+        if r.status_code == 429:
+            wait = int(r.headers.get("Retry-After", 5))
+            metrics["rate_limit_waits"] += 1
+            if wait > MAX_RATE_LIMIT_WAIT:
+                raise requests.exceptions.HTTPError(
+                    f"Spotify rate limit de {wait}s — demasiado largo, abortando.",
+                    response=r,
+                )
+            total = wait + random.uniform(0.2, 1.0)
+            log.warning(f"  ⏳ Rate limit de Spotify — esperando {total:.1f}s antes de reintentar...")
+            time.sleep(total)
+            continue
+
+        r.raise_for_status()
+        return r
+    raise requests.exceptions.HTTPError("Spotify no respondió tras 4 intentos.", response=r)
+
+def sp_get(sp, url, params=None):
+    return _sp_request(sp, "GET", url, params=params).json()
 
 def sp_post(sp, url, payload):
-    metrics["spotify_requests"] += 1
-    r = requests.post(url, headers=sp_headers(sp), json=payload)
-    r.raise_for_status()
-    return r.json()
+    return _sp_request(sp, "POST", url, payload=payload).json()
 
 def sp_delete(sp, url, payload):
-    metrics["spotify_requests"] += 1
-    r = requests.delete(url, headers=sp_headers(sp), json=payload)
-    r.raise_for_status()
+    _sp_request(sp, "DELETE", url, payload=payload)
 
 # ─── Helpers YouTube ─────────────────────────────────────────────────────────
 def get_youtube_tracks(youtube, playlist_id: str) -> list[dict]:
@@ -584,11 +594,8 @@ def main():
                 any_aborted = True
         except Exception as e:
             log.error(f"Error sincronizando '{pl.get('spotify_name')}': {e}")
+            any_aborted = True  # cualquier excepción inesperada también bloquea la limpieza
 
-    if any_aborted:
-        log.warning("  ⚠ Al menos un sync fue interrumpido — cache no se limpiará para evitar pérdida de datos.")
-    else:
-        clean_search_cache(all_ytm_keys)
     save_pending_review(all_pending)
 
     with open("ytm_tracks.json", "w", encoding="utf-8") as f:

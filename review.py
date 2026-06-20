@@ -203,59 +203,62 @@ def review():
                     print("  Buscando opciones en Spotify...")
                     options = search_options(sp, title, artist)
 
-                    if options:
-                        print("\n  Resultados encontrados:")
-                        for j, opt in enumerate(options, 1):
-                            print(f"    {j}. {opt['artist']} — {opt['name']}")
-                            print(f"       Album: {opt['album']}")
-                            print(f"       {opt['url']}")
-                        
-                        print("\n  Opciones de búsqueda:")
-                        for j in range(1, len(options) + 1):
-                            print(f"    {j} → elegir opción {j}")
-                        print("    m → ingresar ID de Spotify manualmente")
-                        print("    s → skip (no sincronizar esta canción)")
-                        print("    n → dejar para después (siguiente track)")
-                        print("    q → guardar decisiones tomadas y salir")
-                        print("    v → volver al menú anterior")
-
-                        sub_choice_valid = False
-                        while not sub_choice_valid:
-                            sub_choice = input("\n  Tu elección (de búsqueda): ").strip().lower()
-                            if sub_choice in ("1", "2", "3") and int(sub_choice) <= len(options):
-                                chosen = options[int(sub_choice) - 1]
-                                new_decisions[key] = chosen["id"]
-                                print(f"  ✅ Seleccionado: {chosen['artist']} — {chosen['name']}")
-                                saved += 1
-                                sub_choice_valid = True
-                                break
-                            elif sub_choice == "m":
-                                choice = "m"  # pasar al prompt manual
-                                sub_choice_valid = True
-                            elif sub_choice == "s":
-                                choice = "s"  # pasar a skip
-                                sub_choice_valid = True
-                            elif sub_choice == "n":
-                                choice = "n"  # pasar a next
-                                sub_choice_valid = True
-                            elif sub_choice == "q":
-                                choice = "q"
-                                should_exit = True
-                                sub_choice_valid = True
-                            elif sub_choice == "v":
-                                sub_choice_valid = True
-                                continue
-                            else:
-                                print("  Opción inválida, intenta de nuevo.")
-                        
-                        if key in new_decisions:
-                            break
-                        if should_exit:
-                            break
-                    else:
+                    if not options:
                         print("  ❌ Sin resultados en Spotify.")
                         continue
 
+                    print("\n  Resultados encontrados:")
+                    for j, opt in enumerate(options, 1):
+                        print(f"    {j}. {opt['artist']} — {opt['name']}")
+                        print(f"       Album: {opt['album']}")
+                        print(f"       {opt['url']}")
+
+                    print("\n  Opciones de búsqueda:")
+                    for j in range(1, len(options) + 1):
+                        print(f"    {j} → elegir opción {j}")
+                    print("    m → ingresar ID de Spotify manualmente")
+                    print("    s → skip (no sincronizar esta canción)")
+                    print("    n → dejar para después (siguiente track)")
+                    print("    q → guardar decisiones tomadas y salir")
+                    print("    v → volver al menú principal")
+
+                    while True:
+                        sub = input("\n  Tu elección (de búsqueda): ").strip().lower()
+                        if sub in ("1", "2", "3") and int(sub) <= len(options):
+                            chosen = options[int(sub) - 1]
+                            new_decisions[key] = chosen["id"]
+                            print(f"  ✅ Seleccionado: {chosen['artist']} — {chosen['name']}")
+                            saved += 1
+                            break
+                        elif sub == "m":
+                            raw = input("  ID o Link de Spotify: ").strip()
+                            if "spotify.com/track/" in raw:
+                                spotify_id = raw.split("spotify.com/track/")[1].split("?")[0]
+                            else:
+                                spotify_id = raw
+                            new_decisions[key] = spotify_id
+                            print(f"  ✅ Seleccionado ID manual: {spotify_id}")
+                            saved += 1
+                            break
+                        elif sub == "s":
+                            new_decisions[key] = "skip"
+                            print("  ⏭ Skip seleccionado.")
+                            saved += 1
+                            break
+                        elif sub == "n":
+                            print("  ⏩ Dejado para después.")
+                            break
+                        elif sub == "q":
+                            should_exit = True
+                            break
+                        elif sub == "v":
+                            break  # sale del sub-menú, vuelve al menú principal
+                        else:
+                            print("  Opción inválida, intenta de nuevo.")
+                    # propagar la decisión al loop externo
+                    if key in new_decisions or should_exit:
+                        break
+                    continue  # "v" o "n": volver al menú principal limpiamente
                 elif choice == "m":
                     raw_input = input("  ID o Link de Spotify: ").strip()
                     if raw_input:
@@ -300,9 +303,20 @@ def review():
     else:
         print("\n  Sin cambios guardados.")
 
+    # Eliminar del pending_review.json las entradas que ya tienen decisión
+    # (ya sea en new_decisions o en manual_matches cargados al inicio).
+    all_resolved = set(manual_matches.keys()) | set(new_decisions.keys())
+    remaining = [t for t in pending if _cache_key(t["title"], t["artist"]) not in all_resolved]
+    with open(PENDING_REVIEW_FILE, "w", encoding="utf-8") as f:
+        json.dump(remaining, f, ensure_ascii=False, indent=2)
+    if remaining:
+        print(f"  📋 {len(remaining)} canción(es) aún pendientes en {PENDING_REVIEW_FILE}.")
+    else:
+        print(f"  ✅ {PENDING_REVIEW_FILE} vaciado — todas las canciones resueltas.")
+
 
 def clean(ytm_tracks_file: str = "ytm_tracks.json") -> None:
-    """Elimina de Supabase las entradas cuya canción ya no está en YTM."""
+    """Elimina de mapeos_manuales las entradas cuya canción ya no está en YTM."""
     if not os.path.exists(ytm_tracks_file):
         print(f"❌ No se encontró {ytm_tracks_file}. Corre sync.py primero.")
         return
@@ -315,28 +329,78 @@ def clean(ytm_tracks_file: str = "ytm_tracks.json") -> None:
 
     orphans = [k for k in manual_matches if k not in ytm_keys]
     if not orphans:
-        print("✅ No hay entradas huérfanas en Supabase.")
+        print("✅ No hay entradas huérfanas en mapeos_manuales.")
         return
 
-    print(f"\n🧹 {len(orphans)} entrada(s) huérfana(s) encontradas en la nube:\n")
+    print(f"\n🧹 {len(orphans)} entrada(s) huérfana(s) en mapeos_manuales (de {len(manual_matches)} totales):\n")
     for k in orphans:
         print(f"  - {k} → {manual_matches[k]}")
 
-    confirm = input("\n¿Eliminar estas entradas de Supabase? (s/n): ").strip().lower()
-    if confirm == "s":
+    print(f"\n⚠  Esto eliminará {len(orphans)} entrada(s) de Supabase permanentemente.")
+    confirm = input("¿Confirmar eliminación? (escribe 'si' para continuar): ").strip().lower()
+    if confirm == "si":
+        eliminadas = 0
         for k in orphans:
             try:
                 supabase.table("mapeos_manuales").delete().eq("nombre_busqueda", k).execute()
-                print(f"  🗑️ Eliminado: {k}")
+                eliminadas += 1
             except Exception as e:
                 print(f"  ❌ No se pudo eliminar {k}: {e}")
-        print("✅ Proceso de limpieza finalizado.")
+        print(f"✅ {eliminadas} entrada(s) eliminadas de mapeos_manuales.")
     else:
-        print("  Cancelado.")
+        print("  Cancelado — no se eliminó nada.")
+
+
+def clean_cache(ytm_tracks_file: str = "ytm_tracks.json") -> None:
+    """Elimina de canciones (caché automático) las entradas huérfanas."""
+    if not os.path.exists(ytm_tracks_file):
+        print(f"❌ No se encontró {ytm_tracks_file}. Corre sync.py primero.")
+        return
+
+    with open(ytm_tracks_file, encoding="utf-8") as f:
+        ytm_tracks = json.load(f)
+
+    if not ytm_tracks:
+        print("❌ ytm_tracks.json está vacío — abortando para no borrar todo el caché.")
+        return
+
+    ytm_keys = {_cache_key(t["title"], t["artist"]) for t in ytm_tracks}
+    cache = load_search_cache()
+
+    orphans = [k for k in cache if k not in ytm_keys]
+    if not orphans:
+        print("✅ No hay entradas huérfanas en el caché (canciones).")
+        return
+
+    print(f"\n🧹 {len(orphans)} entrada(s) huérfana(s) en canciones (de {len(cache)} totales):\n")
+
+    # Mostrar solo las primeras 30 para no inundar la pantalla
+    for k in orphans[:30]:
+        print(f"  - {k} → {cache[k] or 'null'}")
+    if len(orphans) > 30:
+        print(f"  ... y {len(orphans) - 30} más.")
+
+    print(f"\n⚠  Esto eliminará {len(orphans)} entrada(s) del caché automático permanentemente.")
+    print("   El caché se reconstruirá solo en los próximos runs de sync.py.")
+    confirm = input("¿Confirmar eliminación? (escribe 'si' para continuar): ").strip().lower()
+    if confirm == "si":
+        eliminadas = 0
+        for k in orphans:
+            try:
+                supabase.table("canciones").delete().eq("nombre_busqueda", k).execute()
+                eliminadas += 1
+            except Exception as e:
+                print(f"  ❌ No se pudo eliminar {k}: {e}")
+        print(f"✅ {eliminadas} entrada(s) eliminadas del caché.")
+    else:
+        print("  Cancelado — no se eliminó nada.")
+
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--clean":
         clean()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--clean-cache":
+        clean_cache()
     else:
         review()
