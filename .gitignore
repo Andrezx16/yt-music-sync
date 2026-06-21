@@ -8,7 +8,6 @@ ytm_tracks.json
 manual_matches.json
 migracion.py
 descargar_json.py
-review.py
 backup.py
 backup_canciones.json
 backup_mapeos_manuales.json

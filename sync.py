@@ -292,6 +292,52 @@ def get_spotify_tracks(sp, playlist_id: str) -> list[dict]:
         offset += 100
     return tracks
 
+# Canales de YouTube que no corresponden a artistas reales en Spotify.
+_FAKE_ARTISTS = {
+    "release", "the a1 plug", "snitm", "dripp4n", "kianyel", "briiel",
+    "briielbtmf", "prod stone", "proodbyng", "jo.onethebeat", "anibaaal 808",
+    "freestyle mania season", "los mas odiau", "urban music tv", "bymgxzz",
+    "yovngfelo", "dvnne", "kvcti", "flirtdexity", "world star hip hop",
+    "worldstarhiphop", "trap house latino", "miflow tv", "mundo music",
+    "sbeᶻᶻ", "ap", "k10", "kylowtw", "pouliryc", "recxo",
+}
+
+def _normalize(s: str) -> str:
+    import re, unicodedata
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r"\(.*?\)", "", s)
+    s = re.sub(r"\[.*?\]", "", s)
+    s = re.sub(r"[^\w\s]", " ", s)
+    return " ".join(s.lower().split())
+
+def _title_matches(sp_name: str, ytm_title: str) -> bool:
+    sp  = _normalize(sp_name)
+    ytm = _normalize(ytm_title)
+    if not sp or not ytm:
+        return False
+    if sp == ytm:
+        return True
+    if sp in ytm or ytm in sp:
+        return True
+    ytm_words = set(ytm.split())
+    sp_words  = set(sp.split())
+    if not ytm_words:
+        return False
+    overlap = len(ytm_words & sp_words) / len(ytm_words)
+    return overlap >= 0.6
+
+def _sp_search(sp, query: str, limit: int = 5) -> list:
+    result = sp_get(sp, "https://api.spotify.com/v1/search",
+                    {"q": query, "type": "track", "limit": limit})
+    return result["tracks"]["items"]
+
+def _best_match(items: list, ytm_title: str) -> str | None:
+    for item in items:
+        if _title_matches(item["name"], ytm_title):
+            return item["id"]
+    return None
+
 def search_spotify_track(sp, title: str, artist: str, title_conflicts: set[str] | None = None) -> str | None:
     in_cache, cached_id = get_cached_track(title, artist, title_conflicts)
     if in_cache:
@@ -299,52 +345,58 @@ def search_spotify_track(sp, title: str, artist: str, title_conflicts: set[str] 
         return cached_id
 
     metrics["spotify_searches"] += 1
+    import re
     artist_clean = artist.replace(" - Topic", "").strip()
-    query_strict = f"track:{title} artist:{artist_clean}" if artist_clean else f"track:{title}"
-    query_loose  = f"{title} {artist_clean}"
+    artist_lower = artist_clean.lower()
+    is_fake      = artist_lower in _FAKE_ARTISTS
 
-    for attempt in range(3):
-        try:
-            result = sp_get(sp, "https://api.spotify.com/v1/search",
-                            {"q": query_strict, "type": "track", "limit": 1})
-            items = result["tracks"]["items"]
-            if items:
-                spotify_id = items[0]["id"]
+    title_real  = title
+    artist_real = artist_clean
+    m = re.match(r"^(.+?)\s+[-–—]\s+(.+)$", title)
+    if m and (is_fake or not artist_clean):
+        artist_real = m.group(1).strip()
+        title_real  = m.group(2).strip()
+
+    def _try(query: str, validate: bool = True) -> str | None:
+        items = _sp_search(sp, query, limit=5)
+        if not items:
+            return None
+        if validate:
+            return _best_match(items, title_real)
+        return items[0]["id"]
+
+    spotify_id = None
+    try:
+        # Estrategia 1: título + artista real
+        if artist_real and artist_real.lower() not in _FAKE_ARTISTS:
+            spotify_id = _try(f"track:{title_real} artist:{artist_real}")
+            if spotify_id:
                 set_cached_track(title, artist, spotify_id)
                 return spotify_id
 
-            result = sp_get(sp, "https://api.spotify.com/v1/search",
-                            {"q": query_loose, "type": "track", "limit": 1})
-            items = result["tracks"]["items"]
-            spotify_id = items[0]["id"] if items else None
-            set_cached_track(title, artist, spotify_id) 
+        # Estrategia 2: solo título con field filter
+        spotify_id = _try(f"track:{title_real}")
+        if spotify_id:
+            set_cached_track(title, artist, spotify_id)
             return spotify_id
 
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:
-                wait = int(e.response.headers.get("Retry-After", 5))
-                if wait > 60:
-                    raise SpotifyRateLimitError(
-                        f"Spotify rate limit de {wait}s — abortando búsquedas"
-                    )
-                jitter = random.uniform(0.2, 1.0)
-                total_wait = wait + jitter
-                metrics["rate_limit_waits"] += 1
-                log.warning(f"  Rate limit, esperando {total_wait:.1f}s...")
-                time.sleep(total_wait)
-                continue
-            else:
-                log.warning(f"  Error buscando '{title}': {e}")
-                set_cached_track(title, artist, None)
-                return None
-        except Exception as e:
-            log.warning(f"  Error buscando '{title}': {e}")
-            set_cached_track(title, artist, None)
-            return None
+        # Estrategia 3: query libre título + artista
+        if artist_real and artist_real.lower() not in _FAKE_ARTISTS:
+            spotify_id = _try(f"{title_real} {artist_real}")
+            if spotify_id:
+                set_cached_track(title, artist, spotify_id)
+                return spotify_id
 
-    log.warning(f"  No se pudo buscar '{title}' tras 3 intentos.")
-    set_cached_track(title, artist, None)
-    return None
+        # Estrategia 4: solo título libre
+        spotify_id = _try(f"{title_real}", validate=True)
+
+    except SpotifyRateLimitError:
+        raise
+    except Exception as e:
+        log.warning(f"  Error buscando '{title}': {e}")
+
+    set_cached_track(title, artist, spotify_id)
+    return spotify_id
 
 def clear_playlist(sp, playlist_id: str, current_tracks: list[dict]):
     if not current_tracks:
@@ -409,6 +461,13 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str, searches_done: li
     not_found     = []
     pending       = []
     new_track_ids = []
+    id_to_ytm: dict = {}  # spotify_id → [label, ...] para detectar duplicados con culpable exacto
+
+    def _append_track(spotify_id: str, track: dict) -> None:
+        """Agrega un ID a new_track_ids y registra qué canción YTM lo generó."""
+        new_track_ids.append(spotify_id)
+        label = f"{track['artist']} — {track['title']}"
+        id_to_ytm.setdefault(spotify_id, []).append(label)
 
     # Títulos que aparecen más de una vez en el batch YTM actual (con artistas distintos).
     # Usados para deshabilitar el fallback por-título del caché cuando sería ambiguo.
@@ -425,10 +484,10 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str, searches_done: li
         artist = track["artist"].lower()
 
         if (title, artist) in sp_map_title_artist:
-            new_track_ids.append(sp_map_title_artist[(title, artist)])
+            _append_track(sp_map_title_artist[(title, artist)], track)
             continue
         if title in sp_map_title_only and title not in title_conflicts:
-            new_track_ids.append(sp_map_title_only[title])
+            _append_track(sp_map_title_only[title], track)
             continue
 
         in_manual, manual_id = get_manual_match(track["title"], track["artist"])
@@ -437,14 +496,14 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str, searches_done: li
                 metrics["skipped"] += 1
             else:
                 metrics["manual_matches"] += 1
-                new_track_ids.append(manual_id)
+                _append_track(manual_id, track)
             continue
 
         in_cache, cached_id = get_cached_track(track["title"], track["artist"], title_conflicts)
         if in_cache:
             metrics["cache_hits"] += 1
             if cached_id:
-                new_track_ids.append(cached_id)
+                _append_track(cached_id, track)
                 pending.append({"title": track["title"], "artist": track["artist"]})
                 log.info(f"  📦 Cache (revisar): {track['artist']} — {track['title']}")
             else:
@@ -478,7 +537,7 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str, searches_done: li
             ytm_keys = {_cache_key(t["title"], t["artist"]) for t in ytm_tracks}
             return pending, ytm_keys, ytm_tracks, True  
         if spotify_id:
-            new_track_ids.append(spotify_id)
+            _append_track(spotify_id, track)
             sp_map_title_artist[(title, artist)] = spotify_id
             # Solo agregar al mapa de solo-título si no genera ambigüedad
             if title not in title_conflicts:
@@ -503,7 +562,14 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str, searches_done: li
             seen.add(tid)
             deduped_track_ids.append(tid)
     if len(deduped_track_ids) < len(new_track_ids):
-        log.warning(f"  ⚠ {len(new_track_ids) - len(deduped_track_ids)} ID(s) duplicado(s) en new_track_ids — eliminados antes de sincronizar.")
+        n_dups = len(new_track_ids) - len(deduped_track_ids)
+        log.warning(f"  ⚠ {n_dups} ID(s) duplicado(s) en new_track_ids — eliminados antes de sincronizar.")
+        for sid, tracks in id_to_ytm.items():
+            if len(tracks) > 1:
+                log.warning(f"    {sid} → compartido por: {' | '.join(tracks)}")
+                for label in tracks[1:]:
+                    artist, title = label.split(" — ", 1) if " — " in label else ("", label)
+                    pending.append({"title": title, "artist": artist, "reason": "duplicate_id"})
     new_track_ids = deduped_track_ids
 
     if new_track_ids == sp_ids_current:

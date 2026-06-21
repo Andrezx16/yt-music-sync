@@ -66,33 +66,65 @@ def sp_headers(sp: spotipy.Spotify) -> dict:
     token = sp.auth_manager.get_cached_token()["access_token"]
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
+# Canales de YouTube que no son artistas reales en Spotify
+_FAKE_ARTISTS = {
+    "release", "the a1 plug", "snitm", "dripp4n", "kianyel", "briiel",
+    "briielbtmf", "prod stone", "proodbyng", "jo.onethebeat", "anibaaal 808",
+    "freestyle mania season", "los mas odiau", "urban music tv", "bymgxzz",
+    "yovngfelo", "dvnne", "kvcti", "flirtdexity", "world star hip hop",
+    "worldstarhiphop", "trap house latino", "miflow tv", "mundo music",
+    "sbeᶻᶻ", "ap", "k10", "kylowtw", "pouliryc", "recxo",
+}
+
+def _normalize(s: str) -> str:
+    import re, unicodedata
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r"\(.*?\)", "", s)
+    s = re.sub(r"\[.*?\]", "", s)
+    s = re.sub(r"[^\w\s]", " ", s)
+    return " ".join(s.lower().split())
+
 def search_options(sp: spotipy.Spotify, title: str, artist: str) -> list[dict]:
-    """Busca 3 opciones en Spotify para una canción."""
+    """Busca hasta 5 opciones en Spotify usando la misma cascada de estrategias que sync.py."""
+    import re
     artist_clean = artist.replace(" - Topic", "").strip()
+    artist_lower = artist_clean.lower()
+    is_fake = artist_lower in _FAKE_ARTISTS
     headers = sp_headers(sp)
 
-    # Query estricta primero
-    r = requests.get(
-        "https://api.spotify.com/v1/search",
-        headers=headers,
-        params={"q": f"track:{title} artist:{artist_clean}", "type": "track", "limit": 3},
-    )
-    items = r.json().get("tracks", {}).get("items", [])
+    # Extraer artista real si el título tiene formato "Artista - Título"
+    title_real = title
+    artist_real = artist_clean
+    m = re.match(r"^(.+?)\s+[-–—]\s+(.+)$", title)
+    if m and (is_fake or not artist_clean):
+        artist_real = m.group(1).strip()
+        title_real  = m.group(2).strip()
 
-    # Si no hay suficientes, complementar con query libre
-    if len(items) < 3:
-        r2 = requests.get(
+    def _search(q: str) -> list:
+        r = requests.get(
             "https://api.spotify.com/v1/search",
             headers=headers,
-            params={"q": f"{title} {artist_clean}", "type": "track", "limit": 3},
+            params={"q": q, "type": "track", "limit": 5},
         )
-        extra = r2.json().get("tracks", {}).get("items", [])
-        seen_ids = {t["id"] for t in items}
-        for t in extra:
+        return r.json().get("tracks", {}).get("items", [])
+
+    seen_ids: set = set()
+    items: list = []
+
+    def _add(new_items: list) -> None:
+        for t in new_items:
             if t["id"] not in seen_ids:
+                seen_ids.add(t["id"])
                 items.append(t)
-            if len(items) >= 3:
-                break
+
+    # Mismas 4 estrategias que sync.py, acumulando resultados únicos
+    if artist_real and artist_real.lower() not in _FAKE_ARTISTS:
+        _add(_search(f"track:{title_real} artist:{artist_real}"))
+    _add(_search(f"track:{title_real}"))
+    if artist_real and artist_real.lower() not in _FAKE_ARTISTS:
+        _add(_search(f"{title_real} {artist_real}"))
+    _add(_search(f"{title_real}"))
 
     return [
         {
@@ -102,7 +134,7 @@ def search_options(sp: spotipy.Spotify, title: str, artist: str) -> list[dict]:
             "album": t["album"]["name"],
             "url": t["external_urls"].get("spotify", ""),
         }
-        for t in items[:3]
+        for t in items[:5]
     ]
 
 def load_manual_matches() -> dict:
@@ -161,15 +193,32 @@ def review():
 
     saved = 0
     new_decisions = {}
-    
+
+    def parse_id(raw: str) -> str:
+        raw = raw.strip()
+        if "spotify.com/track/" in raw:
+            return raw.split("spotify.com/track/")[1].split("?")[0]
+        return raw
+
     try:
-        for i, track in enumerate(to_review, 1):
-            title  = track["title"]
-            artist = track["artist"]
-            key    = _cache_key(title, artist)
+        i = 0
+        while i < len(to_review):
+            track     = to_review[i]
+            title     = track["title"]
+            artist    = track["artist"]
+            reason    = track.get("reason", "")
+            key       = _cache_key(title, artist)
             cached_id = search_cache.get(key)
 
-            print(f"\n[{i}/{len(to_review)}] {artist} — {title}")
+            reason_label = {
+                "fuzzy_title_match": "⚠  Match por título (artista difiere)",
+                "not_found":         "✗  No encontrada automáticamente",
+                "duplicate_id":      "🔁 ID duplicado con otra canción en la playlist",
+            }.get(reason, "")
+
+            print(f"\n[{i+1}/{len(to_review)}] {artist} — {title}")
+            if reason_label:
+                print(f"  {reason_label}")
             if cached_id:
                 print(f"  ID actual en caché: {cached_id}")
             else:
@@ -177,14 +226,18 @@ def review():
             print("─" * 60)
 
             should_exit = False
+            go_back     = False
+
             while True:
                 print("\n  Opciones:")
                 if cached_id:
                     print("    [Enter] → Aceptar ID actual en caché")
-                print("    b       → Buscar 3 opciones en Spotify")
+                print("    b       → Buscar hasta 5 opciones en Spotify")
                 print("    m       → Ingresar ID de Spotify manualmente")
                 print("    s       → Skip (no sincronizar esta canción)")
                 print("    n       → Dejar para después (siguiente track)")
+                if i > 0:
+                    print("    p       → Volver a la canción anterior")
                 print("    q       → Guardar decisiones tomadas y salir")
 
                 choice = input("\n  Tu elección: ").strip().lower()
@@ -193,7 +246,17 @@ def review():
                     should_exit = True
                     break
 
-                if choice == "" and cached_id:
+                elif choice == "p" and i > 0:
+                    # Retroceder: deshacer decisión anterior si la había
+                    prev_key = _cache_key(to_review[i-1]["title"], to_review[i-1]["artist"])
+                    if prev_key in new_decisions:
+                        del new_decisions[prev_key]
+                        saved -= 1
+                        print(f"  ↩ Decisión anterior deshecha.")
+                    go_back = True
+                    break
+
+                elif choice == "" and cached_id:
                     new_decisions[key] = cached_id
                     print(f"  ✅ Aceptado ID en caché: {cached_id}")
                     saved += 1
@@ -224,7 +287,7 @@ def review():
 
                     while True:
                         sub = input("\n  Tu elección (de búsqueda): ").strip().lower()
-                        if sub in ("1", "2", "3") and int(sub) <= len(options):
+                        if sub.isdigit() and 1 <= int(sub) <= len(options):
                             chosen = options[int(sub) - 1]
                             new_decisions[key] = chosen["id"]
                             print(f"  ✅ Seleccionado: {chosen['artist']} — {chosen['name']}")
@@ -232,12 +295,8 @@ def review():
                             break
                         elif sub == "m":
                             raw = input("  ID o Link de Spotify: ").strip()
-                            if "spotify.com/track/" in raw:
-                                spotify_id = raw.split("spotify.com/track/")[1].split("?")[0]
-                            else:
-                                spotify_id = raw
-                            new_decisions[key] = spotify_id
-                            print(f"  ✅ Seleccionado ID manual: {spotify_id}")
+                            new_decisions[key] = parse_id(raw)
+                            print(f"  ✅ Seleccionado ID manual: {new_decisions[key]}")
                             saved += 1
                             break
                         elif sub == "s":
@@ -252,36 +311,23 @@ def review():
                             should_exit = True
                             break
                         elif sub == "v":
-                            break  # sale del sub-menú, vuelve al menú principal
+                            break
                         else:
                             print("  Opción inválida, intenta de nuevo.")
-                    # propagar la decisión al loop externo
                     if key in new_decisions or should_exit:
                         break
-                    continue  # "v" o "n": volver al menú principal limpiamente
-                elif choice == "m":
-                    raw_input = input("  ID o Link de Spotify: ").strip()
-                    if raw_input:
-                        # Si pegaste el link completo, extraemos el ID que está entre '/track/' y el '?'
-                        if "spotify.com/track/" in raw_input:
-                            try:
-                                # Cortamos lo que está antes del ID y nos quedamos con el resto
-                                spotify_id = raw_input.split("spotify.com/track/")[1]
-                                # Si tiene parámetros de rastreo (?si=...), los eliminamos
-                                spotify_id = spotify_id.split("?")[0]
-                            except IndexError:
-                                spotify_id = raw_input # Por si pasa algo raro, dejamos el input original
-                    else:
-                        spotify_id = raw_input # Si ya era un ID limpio, lo dejamos igual
+                    continue
 
-                    new_decisions[key] = spotify_id
-                    print(f"  ✅ Seleccionado ID manual: {spotify_id}")
+                elif choice == "m":
+                    raw = input("  ID o Link de Spotify: ").strip()
+                    new_decisions[key] = parse_id(raw)
+                    print(f"  ✅ Seleccionado ID manual: {new_decisions[key]}")
                     saved += 1
                     break
 
                 elif choice == "s":
                     new_decisions[key] = "skip"
-                    print(f"  ⏭ Skip seleccionado.")
+                    print("  ⏭ Skip seleccionado.")
                     saved += 1
                     break
 
@@ -294,6 +340,11 @@ def review():
 
             if should_exit:
                 break
+            elif go_back:
+                i -= 1
+            else:
+                i += 1
+
     except KeyboardInterrupt:
         print("\n\n  👋 Saliendo y guardando progreso...")
 
