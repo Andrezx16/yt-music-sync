@@ -114,13 +114,38 @@ def get_manual_match(title: str, artist: str) -> tuple[bool, str | None]:
 PENDING_REVIEW_FILE = "pending_review.json"
 
 def save_pending_review(pending: list[dict]) -> None:
+    # ── Archivo local (compatibilidad con review.py CLI) ──────────────────────
     if not pending:
         if os.path.exists(PENDING_REVIEW_FILE):
             os.remove(PENDING_REVIEW_FILE)
-        return
-    with open(PENDING_REVIEW_FILE, "w", encoding="utf-8") as f:
-        json.dump(pending, f, ensure_ascii=False, indent=2)
-    log.warning(f"  ⚠ {len(pending)} canción(es) pendientes de revisión → corre review.py")
+    else:
+        with open(PENDING_REVIEW_FILE, "w", encoding="utf-8") as f:
+            json.dump(pending, f, ensure_ascii=False, indent=2)
+
+    # ── Supabase: sincronizar tabla canciones_pendientes ──────────────────────
+    try:
+        # Borrar todo lo que había antes y reemplazar con el estado actual.
+        # Esto asegura que la tabla refleje EXACTAMENTE el pending actual,
+        # sin duplicados ni entradas obsoletas.
+        supabase.table("canciones_pendientes").delete().neq("id", 0).execute()
+        if pending:
+            rows = [
+                {
+                    "title":     t["title"],
+                    "artist":    t["artist"],
+                    "reason":    t.get("reason", "not_found"),
+                    "cached_id": t.get("cached_id"),
+                }
+                for t in pending
+            ]
+            supabase.table("canciones_pendientes").insert(rows).execute()
+            log.warning(f"  ⚠ {len(pending)} canción(es) pendientes de revisión → abre la web app o corre review.py")
+        else:
+            log.info("  ✅ Cola de revisión vacía — tabla canciones_pendientes limpiada.")
+    except Exception as e:
+        log.warning(f"  ⚠ No se pudo sincronizar canciones_pendientes en Supabase: {e}")
+        if pending:
+            log.warning(f"  ⚠ {len(pending)} canción(es) pendientes de revisión → corre review.py")
 
 # ─── Métricas ────────────────────────────────────────────────────────────────
 metrics = {
@@ -483,13 +508,6 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str, searches_done: li
         title  = track["title"].lower()
         artist = track["artist"].lower()
 
-        if (title, artist) in sp_map_title_artist:
-            _append_track(sp_map_title_artist[(title, artist)], track)
-            continue
-        if title in sp_map_title_only and title not in title_conflicts:
-            _append_track(sp_map_title_only[title], track)
-            continue
-
         in_manual, manual_id = get_manual_match(track["title"], track["artist"])
         if in_manual:
             if manual_id is None:
@@ -499,16 +517,23 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str, searches_done: li
                 _append_track(manual_id, track)
             continue
 
+        if (title, artist) in sp_map_title_artist:
+            _append_track(sp_map_title_artist[(title, artist)], track)
+            continue
+        if title in sp_map_title_only and title not in title_conflicts:
+            _append_track(sp_map_title_only[title], track)
+            continue
+
         in_cache, cached_id = get_cached_track(track["title"], track["artist"], title_conflicts)
         if in_cache:
             metrics["cache_hits"] += 1
             if cached_id:
                 _append_track(cached_id, track)
-                pending.append({"title": track["title"], "artist": track["artist"]})
+                pending.append({"title": track["title"], "artist": track["artist"], "reason": "fuzzy_title_match", "cached_id": cached_id})
                 log.info(f"  📦 Cache (revisar): {track['artist']} — {track['title']}")
             else:
                 not_found.append(f"{track['artist']} — {track['title']}")
-                pending.append({"title": track["title"], "artist": track["artist"]})
+                pending.append({"title": track["title"], "artist": track["artist"], "reason": "not_found"})
                 log.warning(f"  ✗ No encontrada: {track['artist']} — {track['title']}")
             continue
 
@@ -549,7 +574,7 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str, searches_done: li
             log.info(f"  ✓ Nueva: {track['artist']} — {track['title']}")
         else:
             not_found.append(f"{track['artist']} — {track['title']}")
-            pending.append({"title": track["title"], "artist": track["artist"]})
+            pending.append({"title": track["title"], "artist": track["artist"], "reason": "not_found"})
             log.warning(f"  ✗ No encontrada: {track['artist']} — {track['title']}")
 
     # Bug 2 fix: deduplicar new_track_ids preservando el orden antes de cualquier
@@ -567,7 +592,7 @@ def sync_playlist(youtube, sp, ytm_id: str, spotify_name: str, searches_done: li
         for sid, tracks in id_to_ytm.items():
             if len(tracks) > 1:
                 log.warning(f"    {sid} → compartido por: {' | '.join(tracks)}")
-                for label in tracks[1:]:
+                for label in tracks:
                     artist, title = label.split(" — ", 1) if " — " in label else ("", label)
                     pending.append({"title": title, "artist": artist, "reason": "duplicate_id"})
     new_track_ids = deduped_track_ids
